@@ -1,0 +1,84 @@
+# Production stack: Postgres, the FastAPI backend, and the Next.js frontend.
+#
+# Nothing here publishes a port to the internet. `web` binds 127.0.0.1 only,
+# and Tailscale Serve is what makes it reachable from your devices — CLAUDE.md
+# requires this app not be open to the public internet, and a loopback bind
+# means that stays true even if the Lightsail firewall is later misconfigured.
+#
+# The backend is never published at all: the frontend proxies /api and /v1 to
+# it over the compose network (see next.config.ts), which keeps the session
+# cookie first-party and avoids SameSite=None + a CORS allowlist entirely.
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: obs
+      POSTGRES_USER: obs
+      # Must be URL-safe: the backend interpolates it into OBS_DATABASE_URL
+      # below, and a `/`, `+` or `@` truncates the authority section — psycopg
+      # then reports "failed to resolve host 'obs'", which points nowhere near
+      # the password. Use `openssl rand -hex 32`.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # The backend runs init_schema() and seed_admin() at startup, so it has
+      # to wait for a Postgres that actually accepts connections — not merely
+      # a container that has started.
+      test: ["CMD-SHELL", "pg_isready -U obs -d obs"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    env_file: .env
+    environment:
+      # Overrides whatever .env says: inside the container these are fixed.
+      OBS_HOST: 0.0.0.0
+      OBS_DATABASE_URL: postgresql://obs:${POSTGRES_PASSWORD}@db:5432/obs
+      OBS_DATA_DIR: /data
+      OBS_STORAGE_BACKEND: local
+      # Served same-origin through the frontend, so the cookie is first-party
+      # and Secure is safe (Tailscale Serve terminates real HTTPS).
+      OBS_COOKIE_SECURE: "true"
+      OBS_COOKIE_SAMESITE: lax
+    volumes:
+      - obsdata:/data
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        # A build arg, not an environment variable. Next serialises the rewrite
+        # destination into the build output, so this has to be set when the
+        # image is built — passing it at runtime silently does nothing and
+        # every /api call 500s with ECONNREFUSED on 127.0.0.1:8000.
+        BACKEND_ORIGIN: http://backend:8000
+    ports:
+      # Loopback only. Tailscale Serve proxies to this; the internet cannot.
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  # The trace store. This volume *is* your data — back it up alongside the
+  # Postgres dump, or a rebuilt box comes up with zero traces.
+  obsdata:

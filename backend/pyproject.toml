@@ -1,0 +1,33 @@
+[project]
+name = "obs-backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Tyler Phillips", email = "99523027+Tylerp478@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.120.0",
+    "argon2-cffi>=25.1.0",
+    "duckdb>=1.5.5",
+    "fastapi>=0.140.7",
+    # Step 3's replay runner needs the cost table. Depending on the SDK rather
+    # than copying pricing.py keeps one hand-maintained table instead of two
+    # that drift the first time Anthropic changes a price.
+    "obs-sdk",
+    "opentelemetry-proto>=1.44.0",
+    "psycopg[binary,pool]>=3.3.4",
+    "pyarrow>=25.0.0",
+    "pydantic[email]>=2",
+    "pydantic-settings>=2.14.2",
+    "python-dotenv>=1.2.2",
+    "uvicorn[standard]>=0.51.0",
+]
+
+[tool.uv.sources]
+obs-sdk = { path = "../sdk", editable = true }
+
+[build-system]
+requires = ["uv_build>=0.11.32,<0.12.0"]
+build-backend = "uv_build"

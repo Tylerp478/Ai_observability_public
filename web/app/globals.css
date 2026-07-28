@@ -1,0 +1,253 @@
+@import "tailwindcss";
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   Nocturne — the design-system tokens from the Cascade dashboard mock, ported
+   onto this app's Tailwind palette.
+
+   The mock and this app disagreed about almost nothing structurally: both are
+   dark-first, both lean on a neutral ramp with one accent. So rather than
+   rewrite 6k lines of markup, the palette itself is retuned. Every
+   `bg-neutral-900`, `text-sky-400`, `bg-red-950` already in the pages keeps
+   working and comes out in Nocturne's colors.
+
+   The ramps below are generated in OKLCH on Nocturne's own shared lightness
+   scale (L 0.971 → 0.290 for steps 100 → 900), so a step of any hue matches
+   the same step of every other in visual value. See ramp derivation in
+   `steps_for_user.md`.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* Nocturne's own names, kept so the component classes below read like the
+     source system and so one-off inline styles have something to reach for. */
+  --color-bg: #161826;
+  --color-surface: #232532;
+  --color-text: #e9e9ed;
+  --color-accent: #9184d9;
+  --color-accent-2: #a7a1db;
+  --color-divider: color-mix(in srgb, #e9e9ed 16%, transparent);
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 14px;
+
+  /* Elevation: a hairline edge plus ambient darkness, not a soft drop shadow —
+     drop shadows disappear against a ground this dark. */
+  --shadow-sm: 0 0 0 1px #3f424d;
+  --shadow-md: 0 0 0 1px #595d6c, 0 6px 18px rgba(0, 0, 0, 0.55);
+  --shadow-lg: 0 0 0 1px #9397ab, 0 16px 40px rgba(0, 0, 0, 0.65);
+}
+
+@theme {
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+
+  /* — neutrals — Nocturne's indigo-tinted ramp. 950 and 900 are its page and
+     surface grounds; the app already used those two steps for exactly that. */
+  --color-neutral-50: #f9fafe;
+  --color-neutral-100: #f3f5fe;
+  --color-neutral-200: #e4e7f5;
+  --color-neutral-300: #cfd3e5;
+  --color-neutral-400: #b2b6ca;
+  --color-neutral-500: #9397ab;
+  --color-neutral-600: #75798c;
+  --color-neutral-700: #595d6c;
+  --color-neutral-800: #3f424d;
+  /* One step between 800 and 900 — Nocturne's own 900. The waterfall needs a
+     border that separates rows without competing with the bars themselves. */
+  --color-neutral-850: #292b31;
+  --color-neutral-900: #232532;
+  --color-neutral-950: #161826;
+
+  /* — accent — the app's interactive colour was sky; it becomes Nocturne's
+     blurple (OKLCH hue 289.6). Links, focus rings, primary actions. */
+  --color-sky-50: #faf9ff;
+  --color-sky-100: #f5f4ff;
+  --color-sky-200: #e7e5fe;
+  --color-sky-300: #d2cefd;
+  --color-sky-400: #b5abfc;
+  --color-sky-500: #968ae0;
+  --color-sky-600: #796cbf;
+  --color-sky-700: #5d5294;
+  --color-sky-800: #423a6a;
+  --color-sky-850: #383158;
+  --color-sky-900: #2b2741;
+  --color-sky-950: #212034;
+
+  /* — accent-2 — the secondary mark (violet in the app), same hue, lower
+     chroma, so it reads as related to the accent rather than as a rival. */
+  --color-violet-300: #d2cefd;
+  --color-violet-400: #c1bbe9;
+  --color-violet-500: #a7a1db;
+  --color-violet-600: #8981b9;
+  --color-violet-900: #2b293a;
+
+  /* — status — red/amber/emerald stay semantically distinct (this app has to
+     say pass/warn/fail, which the mock never had to), but they're rebuilt on
+     the same lightness scale, and their dark chip steps are blended toward the
+     page ground so a badge sits on #161826 instead of punching a hole in it. */
+  --color-red-100: #fff0ed;
+  --color-red-200: #ffdbd6;
+  --color-red-300: #ffbdb5;
+  --color-red-400: #ff948c;
+  --color-red-500: #e86c66;
+  --color-red-600: #c2504c;
+  --color-red-700: #983a37;
+  --color-red-800: #662625;
+  --color-red-900: #3a181f;
+  --color-red-950: #21131f;
+
+  --color-amber-100: #fff3e5;
+  --color-amber-200: #fde3c5;
+  --color-amber-300: #f8cb94;
+  --color-amber-400: #e8aa57;
+  --color-amber-500: #ce8703;
+  --color-amber-600: #ab6900;
+  --color-amber-700: #865000;
+  --color-amber-800: #59340b;
+  --color-amber-900: #321f18;
+  --color-amber-950: #1d161e;
+
+  --color-emerald-100: #ebfaf0;
+  --color-emerald-200: #d0f1dd;
+  --color-emerald-300: #a9e4c1;
+  --color-emerald-400: #76cd9c;
+  --color-emerald-500: #42b079;
+  --color-emerald-600: #22905d;
+  --color-emerald-700: #106f46;
+  --color-emerald-800: #0a492e;
+  --color-emerald-900: #0d2a22;
+  --color-emerald-950: #101a1f;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+/* Nocturne's headings: medium weight, tight leading, slight negative tracking.
+   Applied by element so the existing `text-base font-semibold` headings inherit
+   the shape without every page being edited. */
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  font-weight: 500;
+  line-height: 1.12;
+  letter-spacing: -0.015em;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+::selection {
+  background: color-mix(in srgb, var(--color-accent) 30%, transparent);
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: #3f424d;
+  border-radius: 4px;
+}
+
+/* ── Nocturne component classes ────────────────────────────────────────────
+   The handful of treatments that are genuinely hard to express as utilities.
+   Everything else stays Tailwind. */
+
+/* Rules fade to transparent at both ends rather than stopping cleanly — the
+   system's signature. The ramp is 48px an end. Freestanding rules fade; box
+   outlines and short accent marks stay solid. */
+.hr-fade {
+  height: 1px;
+  border: 0;
+  background: linear-gradient(
+    to right,
+    transparent,
+    var(--color-divider) 48px,
+    var(--color-divider) calc(100% - 48px),
+    transparent
+  );
+}
+
+/* Row rules as row-level strips, so the end-fade spans the row and not each
+   cell. Opt in with `.table-fade` on a <table>. */
+.table-fade thead tr {
+  background: linear-gradient(
+      to right,
+      transparent,
+      var(--color-divider) 48px,
+      var(--color-divider) calc(100% - 48px),
+      transparent
+    )
+    no-repeat bottom / 100% 1px;
+}
+.table-fade tbody tr {
+  background: linear-gradient(
+      to right,
+      transparent,
+      color-mix(in srgb, var(--color-text) 8%, transparent) 48px,
+      color-mix(in srgb, var(--color-text) 8%, transparent) calc(100% - 48px),
+      transparent
+    )
+    no-repeat bottom / 100% 1px;
+}
+.table-fade tbody tr:hover {
+  /* the hover tint layers over the row rule, which keeps painting */
+  background:
+    linear-gradient(
+        color-mix(in srgb, var(--color-text) 4%, transparent),
+        color-mix(in srgb, var(--color-text) 4%, transparent)
+      )
+      no-repeat 0 0 / 100% 100%,
+    linear-gradient(
+        to right,
+        transparent,
+        color-mix(in srgb, var(--color-text) 8%, transparent) 48px,
+        color-mix(in srgb, var(--color-text) 8%, transparent) calc(100% - 48px),
+        transparent
+      )
+      no-repeat bottom / 100% 1px;
+}
+
+/* Nocturne's primary action: an outlined accent button, not a filled one. The
+   system leans on the accent's edge rather than a solid block of colour, which
+   is what keeps a page with several actions on it from looking like a toolbar.
+   Call sites keep their own padding, text size and width utilities — this
+   class only owns the border, the colour and the two interaction states. */
+.btn-primary {
+  background: transparent;
+  border: 1px solid var(--color-accent);
+  color: var(--color-accent);
+}
+.btn-primary:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+}
+.btn-primary:active:not(:disabled) {
+  background: color-mix(in srgb, var(--color-accent) 22%, transparent);
+}
+
+/* The all-caps micro-label above a metric. */
+.kicker {
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--color-accent);
+}
+
+.elev-sm {
+  box-shadow: var(--shadow-sm);
+}
+.elev-md {
+  box-shadow: var(--shadow-md);
+}
+.elev-lg {
+  box-shadow: var(--shadow-lg);
+}

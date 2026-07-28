@@ -1,0 +1,35 @@
+# Secrets. .env.example is the checked-in template; .env never is.
+.env
+.env.local
+.env.*.local
+
+# macOS
+.DS_Store
+
+# Claude Code local overrides (settings.json is shareable, .local.json is not)
+.claude/settings.local.json
+
+# Python — sdk/.gitignore repeats these; kept here so future packages
+# (backend/, scorers/) are covered without a per-directory file.
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Node / Next.js — Step 2b
+node_modules/
+.next/
+out/
+.pnpm-store/
+*.tsbuildinfo
+
+# Local trace storage — the filesystem StorageBackend writes Parquet and the
+# WAL here. Data, not source; can be large. Never commit it.
+data/
+*.parquet

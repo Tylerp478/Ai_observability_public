@@ -1,0 +1,6 @@
+# pnpm blocks postinstall build scripts by default (supply-chain protection).
+# These two are Next.js's own image optimizer and its Rust module resolver —
+# both need native binaries built at install time.
+allowBuilds:
+  sharp: true
+  unrs-resolver: true
