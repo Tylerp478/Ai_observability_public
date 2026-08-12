@@ -60,6 +60,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
   const nav = [
     { href: "/", label: "Overview" },
     { href: "/traces", label: "Traces" },
+    { href: "/playground", label: "Playground" },
     { href: "/datasets", label: "Datasets" },
     { href: "/prompts", label: "Prompts" },
     { href: "/scorers", label: "Scorers" },

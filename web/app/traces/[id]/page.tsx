@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useMemo, useState } from "react";
 import { Shell } from "../../shell";
+import { CredentialPicker } from "@/components/credential-picker";
 import {
   api,
   ApiError,
@@ -331,6 +332,7 @@ function ScoreSpan({ span }: { span: Span }) {
   const queryClient = useQueryClient();
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState<string[]>([]);
+  const [credentialId, setCredentialId] = useState("");
 
   const { data } = useQuery({
     queryKey: ["scorers"],
@@ -339,7 +341,8 @@ function ScoreSpan({ span }: { span: Span }) {
   });
 
   const score = useMutation({
-    mutationFn: () => api.scoreSpan(span.trace_id, span.span_id, selected),
+    mutationFn: () =>
+      api.scoreSpan(span.trace_id, span.span_id, selected, credentialId || null),
     onSuccess: () => {
       setOpen(false);
       setSelected([]);
@@ -409,7 +412,12 @@ function ScoreSpan({ span }: { span: Span }) {
             </p>
           )}
 
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <CredentialPicker
+              value={credentialId}
+              onChange={setCredentialId}
+              compact
+            />
             <button
               onClick={() => score.mutate()}
               disabled={selected.length === 0 || score.isPending}

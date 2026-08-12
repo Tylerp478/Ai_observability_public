@@ -162,9 +162,17 @@ uvicorn's startup line rather than a traceback.
 
 ## 8. Publish it to your tailnet
 
+Serve is **disabled by default on a new tailnet**, so this is a two-part step.
+
 ```bash
 sudo tailscale serve --bg 3000
 ```
+
+The first run will likely fail with "Serve is not enabled on your tailnet" and
+print a `https://login.tailscale.com/f/serve?node=…` link. Open that in a
+browser and enable it — that also switches on MagicDNS and HTTPS certificates
+if they aren't already, which is what issues the certificate. Then run the
+command again.
 
 That puts the frontend on `https://<machine>.<tailnet>.ts.net` with a real
 certificate. `tailscale serve status` confirms it.
@@ -226,5 +234,7 @@ git pull && docker compose up -d --build
 | Build killed partway through | Swap missing — redo step 2 |
 | Docker install sits there with no output | apt is blocked on the dpkg lock and the script discards its output. `sudo fuser -v /var/lib/dpkg/lock-frontend` from a second session; wait it out, don't kill it |
 | `permission denied` on the docker socket | The group change needs a fresh login — log out and back in |
+| `Serve is not enabled on your tailnet` | Expected on a new tailnet. Open the `login.tailscale.com/f/serve?node=…` link the CLI prints, enable it, re-run |
 | Site unreachable | `tailscale status` on both the box and the phone; `tailscale serve status` on the box |
+| Tempted to use `http://<tailscale-ip>:3000` | It won't work — compose binds the frontend to 127.0.0.1, and `OBS_COOKIE_SECURE=true` blocks the session cookie over plain HTTP. Use the HTTPS tailnet hostname |
 | "Can't reach the backend" in the UI | `docker compose ps` — the `backend` container is down or unhealthy |

@@ -78,9 +78,17 @@ def _build_otlp_exporter() -> Any:
     api_key = os.environ.get("OBS_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "OBS_EXPORTER requests OTLP export but OBS_API_KEY is not set. "
-            "Create an ingest key with the backend's scripts/create_key.py and put "
-            "it in .env, or set OBS_EXPORTER=console to skip the backend."
+            "OBS_EXPORTER requests OTLP export but OBS_API_KEY is not set.\n"
+            "\n"
+            "Create an ingest key on the Keys page of the web UI — the plaintext is "
+            "shown once, at creation — and put it in .env as OBS_API_KEY. On a fresh "
+            "install with no UI running yet, backend/scripts/bootstrap.py creates the "
+            "schema and a first key.\n"
+            "\n"
+            "Set OBS_SERVICE_NAME too if this is a second app: it is what separates "
+            "one source from another in the Overview and Traces filters.\n"
+            "\n"
+            "Or set OBS_EXPORTER=console to skip the backend entirely."
         )
     return OTLPSpanExporter(endpoint=endpoint, headers={"Authorization": f"Bearer {api_key}"})
 

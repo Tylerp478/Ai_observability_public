@@ -10,6 +10,12 @@ requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.120.0",
     "argon2-cffi>=25.1.0",
+    # Fernet, for provider API keys. These differ from the two credentials the
+    # app already stores: a password is hashed with argon2id and an ingest key
+    # with SHA-256, because both are only ever *compared*. An Anthropic key has
+    # to be *sent*, so it must come back out again — which rules hashing out and
+    # makes symmetric encryption the only honest option.
+    "cryptography>=44.0.0",
     "duckdb>=1.5.5",
     "fastapi>=0.140.7",
     # Step 3's replay runner needs the cost table. Depending on the SDK rather

@@ -472,6 +472,84 @@ CREATE INDEX IF NOT EXISTS guardrail_results_check_idx
     ON guardrail_results(check_id);
 CREATE INDEX IF NOT EXISTS guardrail_results_guardrail_idx
     ON guardrail_results(guardrail_id, created_at DESC);
+
+-- --- 7: provider credentials --------------------------------------------
+-- The Anthropic keys this backend spends on. More than one, so eval spend can
+-- bill to a different account from everything else, chosen at the point of
+-- spending rather than baked into the environment.
+--
+-- The secret is ENCRYPTED, not hashed, and that is the one interesting thing
+-- about this table. A password (users.password_hash) is argon2id and an ingest
+-- key (api_keys.key_hash) is SHA-256 because both are only ever compared
+-- against something the caller already knows. A provider key has to be put in
+-- an Authorization header, so it must come back out — hashing it would make it
+-- useless. That is a genuinely weaker position, and it is why the key material
+-- for this column lives in OBS_SECRET_KEY, outside the database: a dump of
+-- Postgres alone decrypts nothing.
+CREATE TABLE IF NOT EXISTS provider_credentials (
+    id          TEXT PRIMARY KEY,
+    project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    name        TEXT NOT NULL,
+    -- anthropic today. The column exists so a second provider is a value here
+    -- rather than a second table.
+    provider    TEXT NOT NULL DEFAULT 'anthropic',
+    -- Fernet token over the plaintext key. Never returned by the API, never
+    -- logged, never shown again after creation.
+    secret_encrypted TEXT NOT NULL,
+    -- Last four characters of the plaintext, so a key is identifiable in the
+    -- UI without storing anything that helps an attacker.
+    last4       TEXT NOT NULL DEFAULT '',
+    is_default  BOOLEAN NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_used_at TIMESTAMPTZ,
+    -- Soft delete: runs and scores reference the credential that paid for
+    -- them, and hard-deleting would strand that record.
+    archived_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS provider_credentials_name_idx
+    ON provider_credentials(project_id, name) WHERE archived_at IS NULL;
+
+-- Exactly one default per project, enforced by the database rather than by
+-- remembering to clear the old one. Promoting is then "set the new one and let
+-- the constraint reject a second", not a two-statement dance that can be
+-- interrupted halfway.
+CREATE UNIQUE INDEX IF NOT EXISTS provider_credentials_default_idx
+    ON provider_credentials(project_id) WHERE is_default AND archived_at IS NULL;
+
+-- Which key paid. Recorded on everything that spends, so "what did this key
+-- cost me?" is answerable after the fact and a key can be filtered on in the
+-- UI. SET NULL rather than CASCADE: archiving a key must not delete the
+-- history of what it was used for.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS credential_id TEXT
+    REFERENCES provider_credentials(id) ON DELETE SET NULL;
+ALTER TABLE scores ADD COLUMN IF NOT EXISTS credential_id TEXT
+    REFERENCES provider_credentials(id) ON DELETE SET NULL;
+ALTER TABLE guardrail_checks ADD COLUMN IF NOT EXISTS credential_id TEXT
+    REFERENCES provider_credentials(id) ON DELETE SET NULL;
+
+-- Guardrails fire server-side with nobody at the keyboard, so they carry a
+-- configured key instead of being handed one per call. Null means "whatever
+-- the project default is at the time it fires".
+ALTER TABLE guardrails ADD COLUMN IF NOT EXISTS credential_id TEXT
+    REFERENCES provider_credentials(id) ON DELETE SET NULL;
+
+-- Which key paid for the OUTPUT this score judged — as opposed to
+-- scores.credential_id, which is the key that paid for the judge call itself.
+-- They are usually the same, and diverge the moment a finished run is re-scored
+-- with a different key picked in the UI.
+--
+-- This is the one people ask questions about: "how good is what key A produces"
+-- is a question about the generation, not about who graded it.
+--
+-- Stored as the credential NAME, not an id, for two reasons: it is what a span
+-- already carries in obs.credential, so the two agree without a lookup; and a
+-- score keeps naming the key that produced it even after that key is archived
+-- and its row is gone from the picker.
+ALTER TABLE scores ADD COLUMN IF NOT EXISTS generation_credential TEXT NOT NULL DEFAULT '';
+
+CREATE INDEX IF NOT EXISTS scores_generation_credential_idx
+    ON scores(project_id, generation_credential, created_at DESC);
 """
 
 

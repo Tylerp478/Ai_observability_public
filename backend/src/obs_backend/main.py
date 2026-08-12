@@ -22,11 +22,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr
 
-from obs_backend import datasets, guardrails, otlp, prompts, runner, scoring, sessions
+from obs_backend import (
+    credentials,
+    datasets,
+    guardrails,
+    otlp,
+    playground,
+    prompts,
+    runner,
+    scoring,
+    sessions,
+)
 from obs_backend.auth import AuthedKey, create_api_key, require_api_key
 from obs_backend.config import get_settings
+from obs_backend.credentials import CredentialError
 from obs_backend.db import close_pool, get_pool, init_schema
 from obs_backend.guardrails import GuardrailError, GuardrailRateLimited
+from obs_backend.playground import PlaygroundError
 from obs_backend.prompts import PromptError
 from obs_backend.query import TraceQuery
 from obs_backend.runner import RunError
@@ -64,6 +76,7 @@ def _background_loop() -> None:
 async def lifespan(app: FastAPI):
     global _admin_project_id
     _settings.require_anthropic_key()
+    _settings.require_secret_key()
     _settings.require_admin_credentials()
     _settings.check_password_strength()
 
@@ -74,6 +87,17 @@ async def lifespan(app: FastAPI):
     from obs_backend.auth import ensure_project
 
     _admin_project_id = ensure_project("default")
+
+    # The .env key becomes the first stored credential, so an existing install
+    # keeps working without anyone having to visit the UI first.
+    if credentials.seed_from_env(_admin_project_id):
+        print("[credentials] adopted ANTHROPIC_API_KEY from .env as the default key")
+
+    # Scores and runs from before keys existed belong to the one key that could
+    # have made them. No-op once a second key exists.
+    attributed = credentials.backfill_generation_credential(_admin_project_id)
+    if attributed:
+        print(f"[credentials] attributed {attributed} earlier score(s) to the only key")
 
     # A replay run lives on a thread, so anything still marked running at boot
     # died with the last process. Left alone it would poll forever in the UI.
@@ -286,22 +310,52 @@ async def ingest_traces(
 # --------------------------------------------------------------------------
 
 
+@app.get("/api/sources")
+def list_sources(
+    project_id: Annotated[str, Depends(require_any_auth)],
+) -> dict[str, Any]:
+    """What is reporting in. Populates the Overview and Traces filters.
+
+    A source is the OTLP resource's service.name, set per app via
+    OBS_SERVICE_NAME. Derived from the spans rather than stored in a table, so
+    a new app appears the moment it sends its first span and nothing has to be
+    registered first.
+    """
+    return {"sources": _query.sources(project_id)}
+
+
 @app.get("/api/traces")
 def list_traces(
-    project_id: Annotated[str, Depends(require_any_auth)], limit: int = 50
+    project_id: Annotated[str, Depends(require_any_auth)],
+    limit: int = 50,
+    source: str = "",
+    credential: str = "",
 ) -> dict[str, Any]:
-    traces = _query.list_traces(project_id, limit=min(limit, 500))
+    traces = _query.list_traces(
+        project_id,
+        limit=min(limit, 500),
+        source=source or None,
+        credential=credential or None,
+    )
     return {"traces": traces, "count": len(traces)}
 
 
 @app.get("/api/overview")
 def get_overview(
-    project_id: Annotated[str, Depends(require_any_auth)], hours: int = 24
+    project_id: Annotated[str, Depends(require_any_auth)],
+    hours: int = 24,
+    source: str = "",
+    credential: str = "",
 ) -> dict[str, Any]:
     # Capped: the series is one point per hour and the dashboard draws it in a
     # fixed-width chart, so a request for a year of buckets would render as an
     # unreadable smear and scan every Parquet file to build it.
-    return _query.overview(project_id, hours=max(1, min(hours, 168)))
+    return _query.overview(
+        project_id,
+        hours=max(1, min(hours, 168)),
+        source=source or None,
+        credential=credential or None,
+    )
 
 
 @app.get("/api/traces/{trace_id}")
@@ -374,6 +428,83 @@ def revoke_key(
             (key_id, _admin_project_id),
         )
     return {"status": "revoked"}
+
+
+class CredentialRequest(BaseModel):
+    name: str
+    secret: str
+    provider: str = "anthropic"
+    make_default: bool = False
+
+
+@app.get("/api/credentials")
+def list_credentials(
+    user: Annotated[SessionUser, Depends(require_session)],
+) -> dict[str, Any]:
+    """Provider keys, without secrets, with what each has actually cost.
+
+    Session-only, unlike the read API: an ingest key identifies an app sending
+    spans, and that app has no business enumerating the keys this backend
+    spends on.
+
+    Spend is merged in from the span store rather than taken from the
+    credential row's own run/score totals, which miss Playground and guardrail
+    calls entirely. Joined on name because that is what a span records — a span
+    should stay readable without a lookup into a table row that may since have
+    been archived.
+    """
+    spend = _query.spend_by_credential(_admin_project_id)
+    rows = credentials.list_credentials(_admin_project_id)
+    for row in rows:
+        row["spend_usd"] = spend.get(row["name"], 0.0)
+    return {"credentials": rows}
+
+
+@app.post("/api/credentials", status_code=201)
+def create_credential(
+    body: CredentialRequest,
+    user: Annotated[SessionUser, Depends(require_session)],
+) -> dict[str, str]:
+    """Store a provider key. Validated against the provider before saving.
+
+    Returns only the id. The plaintext is never echoed back — unlike an ingest
+    key there is no reason to display it again, because nothing outside this
+    backend ever needs it.
+    """
+    try:
+        credential_id = credentials.create_credential(
+            _admin_project_id,
+            name=body.name,
+            secret=body.secret,
+            provider=body.provider,
+            make_default=body.make_default,
+        )
+    except CredentialError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"id": credential_id}
+
+
+@app.post("/api/credentials/{credential_id}/default")
+def set_default_credential(
+    credential_id: str,
+    user: Annotated[SessionUser, Depends(require_session)],
+) -> dict[str, str]:
+    if not credentials.set_default(_admin_project_id, credential_id):
+        raise HTTPException(status_code=404, detail="Key not found")
+    return {"status": "default"}
+
+
+@app.delete("/api/credentials/{credential_id}")
+def archive_credential(
+    credential_id: str,
+    user: Annotated[SessionUser, Depends(require_session)],
+) -> dict[str, str]:
+    try:
+        if not credentials.archive_credential(_admin_project_id, credential_id):
+            raise HTTPException(status_code=404, detail="Key not found")
+    except CredentialError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "archived"}
 
 
 @app.post("/api/admin/compact")
@@ -513,6 +644,10 @@ class CreateRunRequest(BaseModel):
     prompt_id: str | None = None
     prompt_version_id: str | None = None
     prompt_label: str = ""
+    # Which key this run bills to. Omitted means the project default; whatever
+    # it resolves to is pinned onto the run row, so the answer survives the
+    # default moving afterwards.
+    credential_id: str | None = None
 
 
 @app.get("/api/runs")
@@ -548,8 +683,9 @@ def create_run(
             prompt_id=body.prompt_id,
             prompt_version_id=body.prompt_version_id,
             prompt_label=body.prompt_label,
+            credential_id=body.credential_id,
         )
-    except (RunError, ScorerError) as exc:
+    except (RunError, ScorerError, CredentialError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     runner.start_run(run["id"], _writer)
@@ -619,10 +755,13 @@ class TryScorerRequest(BaseModel):
     output: str
     input: str = ""
     expected: str | None = None
+    credential_id: str | None = None
 
 
 class ScoreRequest(BaseModel):
     scorer_ids: list[str]
+    # Which key pays. Omitted means the project default.
+    credential_id: str | None = None
 
 
 @app.get("/api/scorers")
@@ -724,9 +863,71 @@ def try_scorer(
             output_text=body.output,
             expected=body.expected,
             writer=_writer,
+            credential=credentials.resolve(_admin_project_id, body.credential_id),
         )
-    except ScorerError as exc:
+    except (ScorerError, CredentialError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class PlaygroundRequest(BaseModel):
+    prompt: str
+    model: str
+    max_tokens: int = 1024
+    # Optional, and only substituted if the prompt actually contains
+    # {{input}} — a replay template must carry the placeholder, a one-off
+    # prompt has no reason to.
+    input: str = ""
+    scorer_ids: list[str] = []
+    credential_id: str | None = None
+
+
+@app.post("/api/playground")
+def run_playground(
+    body: PlaygroundRequest,
+    user: Annotated[SessionUser, Depends(require_session)],
+) -> dict[str, Any]:
+    """Send one prompt, keep the span, score the answer. No dataset involved.
+
+    Blocking on the completion for the same reason /try is: one call returns in
+    seconds, and the whole point is a tight loop. Scoring is not blocked on —
+    score_span runs its judges on a thread and the UI polls, which is how every
+    other scoring path in the app behaves.
+    """
+    try:
+        return playground.run(
+            project_id=_admin_project_id,
+            prompt=body.prompt,
+            model=body.model,
+            max_tokens=body.max_tokens,
+            input_text=body.input,
+            scorer_ids=body.scorer_ids,
+            credential_id=body.credential_id,
+            writer=_writer,
+        )
+    except (PlaygroundError, ScorerError, CredentialError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/scores/summary")
+def score_summary(
+    project_id: Annotated[str, Depends(require_any_auth)],
+    hours: int = 24,
+    credential: str = "",
+) -> dict[str, Any]:
+    """Each scorer's headline number over a window, for the dashboard.
+
+    No `source` parameter, unlike the span-backed reads: a score belongs to the
+    judge that produced it, not to the application whose output was judged, so
+    there is no service.name to filter on.
+    """
+    return {
+        "scorers": scoring.average_by_scorer(
+            project_id,
+            hours=max(1, min(hours, 168)),
+            credential=credential or None,
+        ),
+        "window_hours": max(1, min(hours, 168)),
+    }
 
 
 @app.post("/api/runs/{run_id}/score", status_code=202)
@@ -737,8 +938,14 @@ def score_run(
 ) -> dict[str, Any]:
     """Score a finished run. Returns immediately; the UI polls for results."""
     try:
-        calls = scoring.score_run(_admin_project_id, run_id, body.scorer_ids, _writer)
-    except ScorerError as exc:
+        calls = scoring.score_run(
+            _admin_project_id,
+            run_id,
+            body.scorer_ids,
+            _writer,
+            credentials.resolve(_admin_project_id, body.credential_id),
+        )
+    except (ScorerError, CredentialError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "scoring", "judge_calls": calls}
 
@@ -771,8 +978,17 @@ def score_span(
             output_text=span.get("gen_ai_output_messages") or "",
             scorer_ids=body.scorer_ids,
             writer=_writer,
+            credential=credentials.resolve(_admin_project_id, body.credential_id),
+            # Which key produced the text being judged. Read off the span
+            # rather than assumed to be the judge's: scoring a span from last
+            # week with today's key must not relabel who generated it. Spans
+            # written before provider keys existed have no attribute, and stay
+            # unattributed rather than being guessed at.
+            generation_credential=str(
+                (span.get("attributes") or {}).get("obs.credential", "")
+            ),
         )
-    except ScorerError as exc:
+    except (ScorerError, CredentialError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"status": "scoring", "score_ids": score_ids}
 

@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     # failure is far cheaper to diagnose than one mid-eval-run.
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
 
+    # Encrypts provider API keys at rest (credentials.py). A urlsafe-base64
+    # 32-byte Fernet key. Deliberately separate from every other secret: this
+    # one is the difference between a leaked database dump being noise and
+    # being a live Anthropic key with spend attached.
+    secret_key: str = Field(default="", alias="OBS_SECRET_KEY")
+
     # --- Postgres -------------------------------------------------------
     database_url: str = Field(
         default="postgresql://localhost:5432/obs", alias="OBS_DATABASE_URL"
@@ -76,6 +82,28 @@ class Settings(BaseSettings):
                 "ANTHROPIC_API_KEY is not set. Refusing to start — scorer endpoints "
                 "cost money per invocation and failing at boot is cheaper to diagnose "
                 "than failing mid-run. Set it in the repo-root .env."
+            )
+
+    def require_secret_key(self) -> None:
+        """Refuse to start without the key that decrypts stored provider keys.
+
+        Boot-time rather than first-use, matching require_anthropic_key: a
+        backend that starts happily and then cannot decrypt the key it needs
+        fails in the middle of a paid run, which is the expensive place to find
+        out. Losing this value makes every stored provider key unrecoverable —
+        it belongs in whatever you back up.
+        """
+        if not self.secret_key:
+            raise RuntimeError(
+                "OBS_SECRET_KEY is not set. It encrypts provider API keys at rest.\n"
+                "\n"
+                "Generate one:\n"
+                "  python -c \"from cryptography.fernet import Fernet; "
+                'print(Fernet.generate_key().decode())"\n'
+                "\n"
+                "Put it in the repo-root .env as OBS_SECRET_KEY and keep a backup — "
+                "without it, stored provider keys cannot be decrypted and have to be "
+                "entered again."
             )
 
     def require_admin_credentials(self) -> None:

@@ -69,6 +69,26 @@ ARROW_SCHEMA = pa.schema(
 
 _COLUMNS = [f.name for f in ARROW_SCHEMA]
 
+# The same schema spelled for DuckDB, so the query layer can read the WAL with
+# explicit column types instead of letting read_json_auto infer them.
+#
+# Inference is not merely slower here, it is wrong. A WAL file in which every
+# row has a null in some column — one Playground run writes a single parentless
+# span, so `parent_span_id` null-in-every-row is an ordinary state — gets that
+# column inferred as JSON. Unioning it with the Parquet branch, where the same
+# column is VARCHAR, then casts VARCHAR to JSON and dies on the first real span
+# id, because `829e6b15c07335a3` is not a JSON document. The whole traces query
+# fails until the next compaction happens to fold the file away.
+#
+# Derived from ARROW_SCHEMA rather than written out again: these two describe
+# the same rows, and a hand-maintained copy would drift the first time a column
+# is added.
+_DUCKDB_TYPES = {"string": "VARCHAR", "int64": "BIGINT", "double": "DOUBLE"}
+
+DUCKDB_WAL_COLUMNS = {
+    field.name: _DUCKDB_TYPES[str(field.type)] for field in ARROW_SCHEMA
+}
+
 
 def span_to_row(span: Span) -> dict:
     row = span.model_dump(exclude={"events"})

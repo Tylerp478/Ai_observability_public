@@ -2,55 +2,95 @@
 
 import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
+import { Suspense } from "react";
 import { Shell } from "../shell";
+import {
+  CredentialFilter,
+  SourceFilter,
+  useCredentialParam,
+  useSourceParam,
+} from "@/components/source-filter";
 import { api, formatCost, formatDuration, relativeTime } from "@/lib/api";
 
 export default function TracesPage() {
   return (
     <Shell>
-      <TraceList />
+      {/* useSearchParams needs a Suspense boundary above it or the page
+          cannot be prerendered. */}
+      <Suspense fallback={null}>
+        <TraceList />
+      </Suspense>
     </Shell>
   );
 }
 
 function TraceList() {
+  const [source, setSource] = useSourceParam();
+  const [credential, setCredential] = useCredentialParam();
+
   const { data, isLoading, isError } = useQuery({
-    queryKey: ["traces"],
-    queryFn: () => api.traces(50),
+    queryKey: ["traces", source, credential],
+    queryFn: () => api.traces(50, source, credential),
     refetchInterval: 10_000,
   });
 
-  if (isLoading) {
-    return <p className="py-10 text-center text-sm text-neutral-500">Loading traces…</p>;
-  }
-  if (isError) {
-    return <p className="py-10 text-center text-sm text-red-400">Failed to load traces.</p>;
-  }
-
   const traces = data?.traces ?? [];
-
-  if (traces.length === 0) {
-    return (
-      <div className="rounded-xl border border-dashed border-neutral-800 px-6 py-12 text-center">
-        <p className="text-sm text-neutral-300">No traces yet</p>
-        <p className="mt-2 text-xs text-neutral-500">Emit one from the SDK:</p>
-        <code className="mt-3 block overflow-x-auto rounded-lg bg-neutral-900 px-3 py-2 text-left font-mono text-[11px] text-neutral-400">
-          cd sdk &amp;&amp; OBS_EXPORTER=otlp uv run examples/agent_trace.py
-        </code>
-      </div>
-    );
-  }
-
   const totalCost = traces.reduce((sum, t) => sum + t.cost_usd, 0);
 
+  // The header renders in every state, including empty. An early return for
+  // "no traces" would take the source picker off the page at exactly the
+  // moment the filter is the reason the page is empty, leaving no way back
+  // except editing the URL.
   return (
     <div className="space-y-4">
-      <div className="flex items-baseline justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <h1 className="text-base font-semibold">Traces</h1>
-        <p className="text-xs text-neutral-500">
-          {traces.length} · {formatCost(totalCost)} total
-        </p>
+        <div className="flex flex-wrap items-center gap-2.5">
+          <CredentialFilter value={credential} onChange={setCredential} />
+          <SourceFilter value={source} onChange={setSource} />
+          {!isLoading && !isError && (
+            <p className="text-xs text-neutral-500">
+              {traces.length} · {formatCost(totalCost)} total
+            </p>
+          )}
+        </div>
       </div>
+
+      {isLoading && (
+        <p className="py-10 text-center text-sm text-neutral-500">Loading traces…</p>
+      )}
+      {isError && (
+        <p className="py-10 text-center text-sm text-red-400">Failed to load traces.</p>
+      )}
+
+      {!isLoading && !isError && traces.length === 0 && (
+        <div className="rounded-xl border border-dashed border-neutral-800 px-6 py-12 text-center">
+          {source || credential ? (
+            <>
+              <p className="text-sm text-neutral-300">
+                No traces from {[source, credential].filter(Boolean).join(" · ")}
+              </p>
+              <button
+                onClick={() => {
+                  setSource("");
+                  setCredential("");
+                }}
+                className="mt-3 rounded-lg border border-neutral-700 px-2.5 py-1 text-xs text-neutral-400 hover:border-neutral-500 hover:text-neutral-200"
+              >
+                Clear filters
+              </button>
+            </>
+          ) : (
+            <>
+              <p className="text-sm text-neutral-300">No traces yet</p>
+              <p className="mt-2 text-xs text-neutral-500">Emit one from the SDK:</p>
+              <code className="mt-3 block overflow-x-auto rounded-lg bg-neutral-900 px-3 py-2 text-left font-mono text-[11px] text-neutral-400">
+                cd sdk &amp;&amp; OBS_EXPORTER=otlp uv run examples/agent_trace.py
+              </code>
+            </>
+          )}
+        </div>
+      )}
 
       {/* Cards rather than a table. A table with six columns forces horizontal
           scrolling on a phone, and CLAUDE.md calls out the trace list as

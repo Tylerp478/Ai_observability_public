@@ -21,6 +21,12 @@ space hands-on, not to compete with any of them.
   text it sent
 - **Real-time guardrails** that screen an output and answer pass/block before
   it reaches a user
+- **A playground** for running one prompt and scoring the answer without first
+  building a dataset — the result is a real span, so it shows up in traces and
+  in the cost figures like anything else
+- **Multiple provider keys**, chosen at the point of spending. Every run, score
+  and span records which key paid for it, so spend and output quality can both
+  be read per key
 
 ## Stack
 
@@ -39,9 +45,18 @@ visible immediately rather than after the next compaction.
 ## Running it
 
 ```bash
-cp .env.example .env   # set ANTHROPIC_API_KEY, ADMIN_EMAIL, ADMIN_PASSWORD
+cp .env.example .env
 docker compose up -d --build
 ```
+
+`.env` needs four values before it will start — it refuses to boot without
+them rather than failing at the first call:
+
+| | |
+|---|---|
+| `ANTHROPIC_API_KEY` | the model and judge calls |
+| `ADMIN_EMAIL` / `ADMIN_PASSWORD` | seeds the single UI login |
+| `OBS_SECRET_KEY` | encrypts stored provider keys at rest — generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` and **keep a backup**, since losing it means re-entering every stored key |
 
 Then open http://localhost:3000.
 
@@ -58,3 +73,10 @@ Single-user by design. No multi-tenancy, no RBAC, no auth provider — password
 login for one person, and the app is not intended to be exposed to the public
 internet. The S3 storage backend is an interface with a stub behind it; the
 filesystem backend is what runs today.
+
+Anthropic is the only provider wired up. `backend/src/obs_backend/llm.py` is
+the seam a second one would go behind: the completion path ports easily, the
+judge path less so, because structured scoring depends on a forced tool call.
+
+`plan_next_steps.md` carries what is planned next and the reasoning behind the
+decisions already made, including the bugs found along the way.

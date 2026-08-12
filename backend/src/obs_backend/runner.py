@@ -23,7 +23,7 @@ Cancellation is checked between items so a run in progress can be stopped.
 **Runs are background work.** A hundred sequential API calls is minutes, well
 past any HTTP timeout, so POST /api/runs returns immediately with a run id and
 the UI polls. Items run on a small thread pool — sequential would make a
-50-item run a coffee break, and the Anthropic client is thread-safe.
+50-item run a coffee break, and the client behind llm.py is thread-safe.
 """
 
 from __future__ import annotations
@@ -39,11 +39,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from anthropic import Anthropic
 from obs_sdk.pricing import estimate_cost_usd
 
-from obs_backend import prompts, scoring
-from obs_backend.config import get_settings
+from obs_backend import credentials, llm, prompts, scoring
+from obs_backend.credentials import Credential
 from obs_backend.db import get_pool
 from obs_backend.models import Span
 from obs_backend.wal import SpanWriter
@@ -113,6 +112,7 @@ def create_run(
     prompt_id: str | None = None,
     prompt_version_id: str | None = None,
     prompt_label: str = "",
+    credential_id: str | None = None,
 ) -> dict[str, Any]:
     """Validate, materialize the run and its items, and return the run row.
 
@@ -184,6 +184,13 @@ def create_run(
     if requested_scorers:
         scoring.check_run_scoring_budget(len(selected), len(requested_scorers))
 
+    # Resolved here, before anything is spent, for the same reason the scorers
+    # are: "no default key" and "that key was removed" are both knowable now,
+    # and finding either one out mid-run means paying for the calls that got
+    # through first. The id is pinned onto the run, so a run goes on saying
+    # which key paid for it even after the default moves.
+    credential = credentials.resolve(project_id, credential_id)
+
     run_id = _hex(16)
     trace_id = _hex(16)  # 32 hex chars, matching an OTLP trace id
 
@@ -192,8 +199,8 @@ def create_run(
             """
             INSERT INTO runs (id, dataset_id, project_id, name, prompt_template,
                               model, max_tokens, status, item_count, trace_id, error,
-                              scorer_ids, prompt_version_id, prompt_label)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s, %s, %s)
+                              scorer_ids, prompt_version_id, prompt_label, credential_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 run_id,
@@ -214,6 +221,7 @@ def create_run(
                 # on a run that fell back to the latest version would describe a
                 # resolution that never happened.
                 prompt_label.strip().lower() if version and prompt_label else "",
+                credential.id,
             ),
         )
         with conn.cursor() as cur:
@@ -292,7 +300,7 @@ def _execute(run_id: str, writer: SpanWriter) -> None:
         with get_pool().connection() as conn:
             run = conn.execute(
                 "SELECT project_id, dataset_id, name, prompt_template, model, "
-                "max_tokens, trace_id, scorer_ids FROM runs WHERE id = %s",
+                "max_tokens, trace_id, scorer_ids, credential_id FROM runs WHERE id = %s",
                 (run_id,),
             ).fetchone()
             if run is None:
@@ -318,25 +326,25 @@ def _execute(run_id: str, writer: SpanWriter) -> None:
             max_tokens,
             trace_id,
             scorer_ids_json,
+            credential_id,
         ) = run
+
+        # Re-resolved on the worker thread rather than carried from create_run:
+        # the secret should live as briefly as possible, and the id on the run
+        # row is the durable record of which key was chosen.
+        credential = credentials.resolve(project_id, credential_id)
         items = [
             _Item(id=str(r[0]), run_item_id=str(r[1]), ordinal=r[2], input=r[3])
             for r in item_rows
         ]
 
         root_span_id = _hex(8)
-        # Key passed explicitly. pydantic-settings reads .env into the Settings
-        # object without touching os.environ, so the Anthropic client's own env
-        # lookup finds nothing and raises — even though the key is right there
-        # in .env and every other part of the app can see it.
-        client = Anthropic(api_key=get_settings().anthropic_api_key)
 
         def work(item: _Item) -> Span | None:
             if _is_cancelled(run_id):
                 _mark_item(item.run_item_id, status="skipped")
                 return None
             return _run_one(
-                client=client,
                 run_id=run_id,
                 project_id=project_id,
                 trace_id=trace_id,
@@ -345,6 +353,7 @@ def _execute(run_id: str, writer: SpanWriter) -> None:
                 template=template,
                 model=model,
                 max_tokens=max_tokens,
+                credential=credential,
             )
 
         with ThreadPoolExecutor(max_workers=max(1, RUN_CONCURRENCY)) as pool:
@@ -401,7 +410,13 @@ def _execute(run_id: str, writer: SpanWriter) -> None:
             )
         else:
             _finalize(run_id, status="succeeded")
-            _autoscore(run_id, project_id, json.loads(scorer_ids_json or "[]"), writer)
+            _autoscore(
+                run_id,
+                project_id,
+                json.loads(scorer_ids_json or "[]"),
+                writer,
+                credential,
+            )
 
     except Exception as exc:  # noqa: BLE001 — a run must never kill the thread silently
         traceback.print_exc()
@@ -420,7 +435,6 @@ def _execute(run_id: str, writer: SpanWriter) -> None:
 
 def _run_one(
     *,
-    client: Anthropic,
     run_id: str,
     project_id: str,
     trace_id: str,
@@ -429,19 +443,23 @@ def _run_one(
     template: str,
     model: str,
     max_tokens: int,
+    credential: Credential,
 ) -> Span:
     """One test case: render, call, record. Returns the span for the call."""
     prompt = render_prompt(template, item.input)
     span_id = _hex(8)
+
+    # Marked running before the clock starts, so the recorded latency is the
+    # model's and not the model's plus a database round trip.
+    _mark_item(item.run_item_id, status="running", span_id=span_id)
     start_nano = _now_nano()
 
-    _mark_item(item.run_item_id, status="running", span_id=span_id)
-
     try:
-        response = client.messages.create(
+        call = llm.complete(
             model=model,
+            prompt=prompt,
             max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
+            api_key=credential.secret,
         )
     except Exception as exc:
         end_nano = _now_nano()
@@ -465,37 +483,40 @@ def _run_one(
             project_id=project_id,
             service_name="obs-runner",
             gen_ai_operation_name="chat",
-            gen_ai_provider_name="anthropic",
+            gen_ai_provider_name=llm.provider_label(model),
             gen_ai_request_model=model,
             gen_ai_request_max_tokens=max_tokens,
             gen_ai_input_messages=prompt,
             obs_latency_seconds=(end_nano - start_nano) / 1e9,
             attributes_json=json.dumps(
-                {"obs.run_id": run_id, "obs.dataset_item_id": item.id}
+                {
+                "obs.run_id": run_id,
+                "obs.dataset_item_id": item.id,
+                "obs.credential": credential.name,
+            }
             ),
         )
 
-    end_nano = _now_nano()
-    output = "".join(b.text for b in response.content if b.type == "text")
-    latency_ms = (end_nano - start_nano) / 1e6
+    output = call.text
+    latency_ms = call.latency_ms
 
     # Cost is priced on the day the call happened, not today. It is the same
     # instant here, but passing it explicitly keeps this correct if a run is
     # ever re-costed and matters for models on time-boxed intro pricing.
     cost = estimate_cost_usd(
-        response.model,
-        response.usage.input_tokens,
-        response.usage.output_tokens,
+        call.response_model,
+        call.input_tokens,
+        call.output_tokens,
         on=datetime.now(tz=timezone.utc).date(),
     )
-    finish_reason = response.stop_reason or "unknown"
+    finish_reason = call.stop_reason
 
     _mark_item(
         item.run_item_id,
         status="succeeded",
         output=output,
-        input_tokens=response.usage.input_tokens,
-        output_tokens=response.usage.output_tokens,
+        input_tokens=call.input_tokens,
+        output_tokens=call.output_tokens,
         cost_usd=cost,
         latency_ms=latency_ms,
         finish_reason=finish_reason,
@@ -507,32 +528,40 @@ def _run_one(
         span_id=span_id,
         parent_span_id=parent_span_id,
         name=f"chat {model}",
-        start_time_unix_nano=start_nano,
-        end_time_unix_nano=end_nano,
+        start_time_unix_nano=call.start_nano,
+        end_time_unix_nano=call.end_nano,
         status_code="OK",
         project_id=project_id,
         service_name="obs-runner",
         gen_ai_operation_name="chat",
-        gen_ai_provider_name="anthropic",
+        gen_ai_provider_name=llm.provider_label(model),
         gen_ai_request_model=model,
-        gen_ai_response_model=response.model,
-        gen_ai_response_id=response.id,
+        gen_ai_response_model=call.response_model,
+        gen_ai_response_id=call.response_id,
         gen_ai_request_max_tokens=max_tokens,
-        gen_ai_usage_input_tokens=response.usage.input_tokens,
-        gen_ai_usage_output_tokens=response.usage.output_tokens,
+        gen_ai_usage_input_tokens=call.input_tokens,
+        gen_ai_usage_output_tokens=call.output_tokens,
         gen_ai_finish_reasons=json.dumps([finish_reason]),
         gen_ai_input_messages=prompt,
         gen_ai_output_messages=output,
         obs_cost_usd=cost,
         obs_latency_seconds=latency_ms / 1000,
         attributes_json=json.dumps(
-            {"obs.run_id": run_id, "obs.dataset_item_id": item.id}
+            {
+                "obs.run_id": run_id,
+                "obs.dataset_item_id": item.id,
+                "obs.credential": credential.name,
+            }
         ),
     )
 
 
 def _autoscore(
-    run_id: str, project_id: str, scorer_ids: list[str], writer: SpanWriter
+    run_id: str,
+    project_id: str,
+    scorer_ids: list[str],
+    writer: SpanWriter,
+    credential: Credential,
 ) -> None:
     """Kick off scoring for a finished run, if scorers were attached to it.
 
@@ -546,7 +575,7 @@ def _autoscore(
     if not scorer_ids:
         return
     try:
-        scoring.score_run(project_id, run_id, scorer_ids, writer)
+        scoring.score_run(project_id, run_id, scorer_ids, writer, credential)
     except Exception as exc:  # noqa: BLE001
         print(f"[runner] auto-scoring for run {run_id} did not start: {exc}")
 

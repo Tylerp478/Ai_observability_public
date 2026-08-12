@@ -27,6 +27,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
     credentials: "include",
+    // Never read from the HTTP cache. The backend sets no cache headers, which
+    // leaves the browser free to use its heuristic freshness rules on plain
+    // GETs — and it does. The symptom is ugly: a page renders an empty state
+    // while the identical URL, fetched with a cache-buster, returns data, and
+    // the network panel shows a 200 for a response the server never sent this
+    // time. Every read here is live observability data where a stale answer is
+    // worse than a slow one, so there is nothing to trade away.
+    cache: "no-store",
     headers: {
       "Content-Type": "application/json",
       ...(init?.headers ?? {}),
@@ -70,10 +78,85 @@ export interface TraceSummary {
  */
 export interface Overview {
   window_hours: number;
+  /** The source these numbers describe; "" means every source. Echoed back by
+   *  the backend so a filtered zero is distinguishable from an empty one. */
+  source: string;
+  /** The provider key these numbers describe; "" means every key. */
+  credential: string;
   prompts: number;
   duration_ms: number;
   cost_usd: number;
   series: { hour_start: number; prompts: number }[];
+  /**
+   * Share of prompts by model, same window and filters as the totals above,
+   * so these counts sum to `prompts` exactly.
+   *
+   * Keyed on the model that was *requested*, not the one that answered: a
+   * failed call has no response model, and would otherwise drop out of a
+   * breakdown whose whole job is "what did I run".
+   */
+  models: { model: string; prompts: number; cost_usd: number }[];
+}
+
+/**
+ * One service reporting spans in — an instrumented app, or one of the
+ * backend's own internal services (obs-runner, obs-judge, obs-guardrail,
+ * obs-playground). Derived from span data, not registered anywhere, so a new
+ * app shows up the moment it sends its first span.
+ */
+/**
+ * One scorer's headline number over a window.
+ *
+ * Which field carries the answer depends on output_type — `mean` for numeric,
+ * `pass_rate` for boolean, `top_label` for categorical. There is deliberately
+ * no single "score" field: averaging a 1-5 scale together with a pass rate
+ * produces a number that renders convincingly and means nothing.
+ */
+export interface ScorerAverage {
+  scorer_id: string;
+  scorer_name: string;
+  output_type: ScorerOutputType;
+  score_min: number | null;
+  score_max: number | null;
+  pass_threshold: number | null;
+  scored: number;
+  mean: number | null;
+  pass_rate: number | null;
+  top_label: string;
+}
+
+export interface Source {
+  name: string;
+  span_count: number;
+  last_span_unix_nano: number;
+}
+
+/**
+ * A stored provider API key — which Anthropic account a call bills to.
+ *
+ * The secret is never in this object and is never returned by the API. A key
+ * is identified by its name and last four characters; unlike an ingest key
+ * there is no reason to show it again, because nothing outside the backend
+ * ever needs it.
+ */
+export interface Credential {
+  id: string;
+  name: string;
+  provider: string;
+  last4: string;
+  is_default: boolean;
+  created_at: string | null;
+  last_used_at: string | null;
+  run_cost_usd: number;
+  score_cost_usd: number;
+  /**
+   * Everything this key has cost, from the span store.
+   *
+   * Not run_cost_usd + score_cost_usd: those come from Postgres and know only
+   * about eval spend, so a Playground or guardrail call is invisible to them.
+   * Every billable call writes a span, so this is the figure that is true.
+   */
+  spend_usd: number;
 }
 
 export interface Span {
@@ -581,6 +664,32 @@ export function scoreTone(score: Score): string {
   return "bg-neutral-800 text-neutral-300";
 }
 
+/**
+ * One ad-hoc prompt sent from the Playground, with the span it was recorded
+ * as. The scores are NOT here — `score_ids` names the rows that judges are
+ * filling in on a background thread, and the caller polls `api.trace` for the
+ * verdicts, which is how every other scoring path in the app behaves.
+ */
+export interface PlaygroundResult {
+  trace_id: string;
+  span_id: string;
+  prompt: string;
+  output: string;
+  model: string;
+  response_model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number | null;
+  latency_ms: number;
+  finish_reason: string;
+  score_ids: string[];
+  /** Which key paid for this call. */
+  credential_id: string;
+  credential_name: string;
+  /** Non-empty when scorers were picked but there was nothing to judge. */
+  scoring_skipped: string;
+}
+
 /** Models offered in the run form. Kept in step with the SDK pricing table —
  *  a model missing from that table runs fine but reports no cost. */
 export const RUN_MODELS = [
@@ -602,10 +711,51 @@ export const api = {
 
   me: () => request<{ email: string; user_id: string }>("/api/auth/me"),
 
-  overview: (hours = 24) => request<Overview>(`/api/overview?hours=${hours}`),
+  sources: () => request<{ sources: Source[] }>("/api/sources"),
 
-  traces: (limit = 50) =>
-    request<{ traces: TraceSummary[]; count: number }>(`/api/traces?limit=${limit}`),
+  // No `source` argument, unlike the span-backed reads: a score belongs to the
+  // judge that produced it, not to the app whose output was judged.
+  scoreSummary: (hours = 24, credential = "") =>
+    request<{ scorers: ScorerAverage[]; window_hours: number }>(
+      `/api/scores/summary?hours=${hours}` +
+        (credential ? `&credential=${encodeURIComponent(credential)}` : ""),
+    ),
+
+  // --- provider keys ---
+  credentials: () => request<{ credentials: Credential[] }>("/api/credentials"),
+
+  createCredential: (body: {
+    name: string;
+    secret: string;
+    make_default?: boolean;
+  }) =>
+    request<{ id: string }>("/api/credentials", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  setDefaultCredential: (id: string) =>
+    request<{ status: string }>(`/api/credentials/${id}/default`, { method: "POST" }),
+
+  archiveCredential: (id: string) =>
+    request<{ status: string }>(`/api/credentials/${id}`, { method: "DELETE" }),
+
+  // `source` is encoded rather than interpolated raw: a service.name is
+  // whatever the instrumented app set it to, and nothing stops it containing
+  // an ampersand.
+  overview: (hours = 24, source = "", credential = "") =>
+    request<Overview>(
+      `/api/overview?hours=${hours}` +
+        (source ? `&source=${encodeURIComponent(source)}` : "") +
+        (credential ? `&credential=${encodeURIComponent(credential)}` : ""),
+    ),
+
+  traces: (limit = 50, source = "", credential = "") =>
+    request<{ traces: TraceSummary[]; count: number }>(
+      `/api/traces?limit=${limit}` +
+        (source ? `&source=${encodeURIComponent(source)}` : "") +
+        (credential ? `&credential=${encodeURIComponent(credential)}` : ""),
+    ),
 
   trace: (id: string) =>
     request<{
@@ -671,6 +821,7 @@ export const api = {
     max_tokens: number;
     name?: string;
     scorer_ids?: string[];
+    credential_id?: string | null;
   }) => request<Run>("/api/runs", { method: "POST", body: JSON.stringify(body) }),
 
   run: (id: string) =>
@@ -702,23 +853,53 @@ export const api = {
 
   tryScorer: (
     id: string,
-    body: { output: string; input?: string; expected?: string | null },
+    body: {
+      output: string;
+      input?: string;
+      expected?: string | null;
+      credential_id?: string | null;
+    },
   ) =>
     request<TryScorerResult>(`/api/scorers/${id}/try`, {
       method: "POST",
       body: JSON.stringify(body),
     }),
 
-  scoreRun: (runId: string, scorerIds: string[]) =>
-    request<{ status: string; judge_calls: number }>(`/api/runs/${runId}/score`, {
+  // --- playground ---
+  playground: (body: {
+    prompt: string;
+    model: string;
+    max_tokens: number;
+    input?: string;
+    scorer_ids?: string[];
+    credential_id?: string | null;
+  }) =>
+    request<PlaygroundResult>("/api/playground", {
       method: "POST",
-      body: JSON.stringify({ scorer_ids: scorerIds }),
+      body: JSON.stringify(body),
     }),
 
-  scoreSpan: (traceId: string, spanId: string, scorerIds: string[]) =>
+  scoreRun: (runId: string, scorerIds: string[], credentialId?: string | null) =>
+    request<{ status: string; judge_calls: number }>(`/api/runs/${runId}/score`, {
+      method: "POST",
+      body: JSON.stringify({ scorer_ids: scorerIds, credential_id: credentialId }),
+    }),
+
+  scoreSpan: (
+    traceId: string,
+    spanId: string,
+    scorerIds: string[],
+    credentialId?: string | null,
+  ) =>
     request<{ status: string; score_ids: string[] }>(
       `/api/traces/${traceId}/spans/${spanId}/score`,
-      { method: "POST", body: JSON.stringify({ scorer_ids: scorerIds }) },
+      {
+        method: "POST",
+        body: JSON.stringify({
+          scorer_ids: scorerIds,
+          credential_id: credentialId,
+        }),
+      },
     ),
 
   // --- prompts (step 5) ---
@@ -842,6 +1023,50 @@ export function formatCost(usd: number): string {
   // everything as "$0.00" and hide the number that matters.
   if (usd < 0.01) return `$${usd.toFixed(5)}`;
   return `$${usd.toFixed(4)}`;
+}
+
+/**
+ * Coarse cost for the dashboard stat tiles.
+ *
+ * Same split as formatDuration / formatDurationLong, for the same reason.
+ * formatCost is built for one call and spends up to five decimals on it, which
+ * is right in a trace list and too wide for a tile: three tiles across a 375px
+ * phone leaves 83px of text, and "$0.00043" renders at 95px in 20px Inter. It
+ * truncated to "$0.00…" — the worst possible failure for a cost figure, since
+ * the digits it drops are the entire number.
+ *
+ * Below a cent this switches to cents rather than rounding to "<$0.01". During
+ * development nearly every window total is sub-cent, and a tile that reads
+ * "<$0.01" all day answers no question at all. Changing unit by magnitude is
+ * what the duration tile beside it already does (ms → s → m → h); this is the
+ * same move applied to money.
+ *
+ * Every branch is measured to fit 83px.
+ */
+export function formatCostLong(usd: number): string {
+  if (usd === 0) return "$0";
+  if (usd >= 1000) return `$${(usd / 1000).toFixed(1)}k`;
+  if (usd >= 100) return `$${usd.toFixed(0)}`;
+  if (usd >= 1) return `$${usd.toFixed(2)}`;
+  if (usd >= 0.01) return `$${usd.toFixed(3)}`;
+
+  const cents = usd * 100;
+  // toPrecision(2) is safe from exponent notation here: cents is in
+  // [0.01, 1), which formats as "0.010" through "0.99".
+  if (cents >= 0.01) return `${cents.toPrecision(2)}¢`;
+  return "<0.01¢";
+}
+
+/**
+ * Coarse count for the same tiles. Plain toLocaleString is fine up to five
+ * digits; "1,000,000" is 88px and would truncate exactly like the cost did.
+ */
+export function formatCountLong(n: number): string {
+  if (n < 100_000) return n.toLocaleString();
+  return new Intl.NumberFormat(undefined, {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(n);
 }
 
 export function formatTime(unixNano: number): string {

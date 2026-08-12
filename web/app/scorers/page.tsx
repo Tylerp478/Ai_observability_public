@@ -3,6 +3,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Shell } from "../shell";
+import { CredentialPicker } from "@/components/credential-picker";
 import { VersionHistory } from "@/components/version-history";
 import {
   api,
@@ -544,10 +545,16 @@ function TryPanel({ scorer }: { scorer: Scorer }) {
   const [input, setInput] = useState("");
   const [output, setOutput] = useState("");
   const [expected, setExpected] = useState("");
+  const [credentialId, setCredentialId] = useState("");
 
   const run = useMutation<TryScorerResult>({
     mutationFn: () =>
-      api.tryScorer(scorer.id, { output, input, expected: expected || null }),
+      api.tryScorer(scorer.id, {
+        output,
+        input,
+        expected: expected || null,
+        credential_id: credentialId || null,
+      }),
   });
 
   return (
@@ -576,7 +583,8 @@ function TryPanel({ scorer }: { scorer: Scorer }) {
         />
       )}
 
-      <div className="flex items-center gap-3">
+      <div className="flex flex-wrap items-center gap-3">
+        <CredentialPicker value={credentialId} onChange={setCredentialId} compact />
         <button
           onClick={() => run.mutate()}
           disabled={!output.trim() || run.isPending}

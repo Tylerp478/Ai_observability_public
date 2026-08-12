@@ -54,14 +54,12 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from functools import lru_cache
 from typing import Any
 
-from anthropic import Anthropic
 from obs_sdk.pricing import estimate_cost_usd
 
-from obs_backend import prompts
-from obs_backend.config import get_settings
+from obs_backend import llm, prompts
+from obs_backend.credentials import Credential
 from obs_backend.db import get_pool
 from obs_backend.models import Span
 from obs_backend.wal import SpanWriter
@@ -145,13 +143,6 @@ class _Target:
 
 def _hex(n: int) -> str:
     return secrets.token_hex(n)
-
-
-@lru_cache
-def _client() -> Anthropic:
-    # Key passed explicitly: pydantic-settings reads .env into Settings without
-    # touching os.environ, so the SDK's own env lookup would find nothing.
-    return Anthropic(api_key=get_settings().anthropic_api_key)
 
 
 # --------------------------------------------------------------------------
@@ -646,6 +637,7 @@ def judge(
     input_text: str,
     output_text: str,
     expected: str | None,
+    api_key: str,
     timeout: float | None = None,
 ) -> tuple[JudgeResult, dict[str, Any]]:
     """Run one judge call. Returns the result and the raw call metadata.
@@ -660,52 +652,41 @@ def judge(
     prompt = render_judge_prompt(
         scorer, input_text=input_text, output_text=output_text, expected=expected
     )
-    start = time.time_ns()
 
-    response = _client().messages.create(
+    # The forced tool call itself lives in llm.py; what stays here is what the
+    # verdict has to satisfy to count as one.
+    call = llm.tool_call(
         model=scorer.model,
+        prompt=prompt,
         max_tokens=scorer.max_tokens,
-        messages=[{"role": "user", "content": prompt}],
-        **({"timeout": timeout} if timeout is not None else {}),
-        tools=[
-            {
-                "name": TOOL_NAME,
-                "description": (
-                    "Record the evaluation of the output. Call this exactly once, "
-                    "after reasoning about the criterion."
-                ),
-                "input_schema": build_tool_schema(scorer),
-            }
-        ],
-        # The whole point: the model's only legal move is a schema-valid call,
-        # so "the judge replied with a paragraph" stops being a failure mode.
-        tool_choice={"type": "tool", "name": TOOL_NAME},
+        tool_name=TOOL_NAME,
+        tool_description=(
+            "Record the evaluation of the output. Call this exactly once, "
+            "after reasoning about the criterion."
+        ),
+        input_schema=build_tool_schema(scorer),
+        api_key=api_key,
+        timeout=timeout,
     )
-    end = time.time_ns()
 
-    block = next(
-        (b for b in response.content if b.type == "tool_use" and b.name == TOOL_NAME),
-        None,
-    )
-    if block is None:
+    if call.payload is None:
         # Nearly always max_tokens: the tool call was cut off mid-JSON, so the
         # block never completed. Say so, because "no tool call" is otherwise a
         # baffling result from a forced tool call.
         hint = (
             " The judge hit max_tokens before finishing its answer — raise the "
             "scorer's max_tokens."
-            if response.stop_reason == "max_tokens"
+            if call.stop_reason == "max_tokens"
             else ""
         )
         raise ScorerError(f"Judge did not return a {TOOL_NAME} call.{hint}")
 
-    payload = dict(block.input or {})
-    value, label, passed = _interpret(scorer, payload)
+    value, label, passed = _interpret(scorer, call.payload)
 
     cost = estimate_cost_usd(
-        response.model,
-        response.usage.input_tokens,
-        response.usage.output_tokens,
+        call.response_model,
+        call.input_tokens,
+        call.output_tokens,
         on=datetime.now(tz=timezone.utc).date(),
     )
 
@@ -713,20 +694,20 @@ def judge(
         value=value,
         label=label,
         passed=passed,
-        reasoning=str(payload.get("reasoning", "")),
-        input_tokens=response.usage.input_tokens,
-        output_tokens=response.usage.output_tokens,
+        reasoning=str(call.payload.get("reasoning", "")),
+        input_tokens=call.input_tokens,
+        output_tokens=call.output_tokens,
         cost_usd=cost,
-        latency_ms=(end - start) / 1e6,
+        latency_ms=call.latency_ms,
     )
     meta = {
         "prompt": prompt,
-        "response_model": response.model,
-        "response_id": response.id,
-        "stop_reason": response.stop_reason or "unknown",
-        "start_nano": start,
-        "end_nano": end,
-        "payload": payload,
+        "response_model": call.response_model,
+        "response_id": call.response_id,
+        "stop_reason": call.stop_reason,
+        "start_nano": call.start_nano,
+        "end_nano": call.end_nano,
+        "payload": call.payload,
     }
     return result, meta
 
@@ -762,7 +743,7 @@ def judge_span(
         project_id=project_id,
         service_name=service_name,
         gen_ai_operation_name="chat",
-        gen_ai_provider_name="anthropic",
+        gen_ai_provider_name=llm.provider_label(scorer.model),
         gen_ai_request_model=scorer.model,
         gen_ai_response_model=meta.get("response_model"),
         gen_ai_response_id=meta.get("response_id"),
@@ -798,6 +779,8 @@ def _create_score_rows(
     targets: list[dict[str, Any]],
     target_kind: str,
     run_id: str | None,
+    credential_id: str,
+    generation_credential: str,
 ) -> list[tuple[Scorer, _Target]]:
     """Materialize pending score rows so the UI can show work in flight.
 
@@ -836,14 +819,17 @@ def _create_score_rows(
                     # while its own scoring job is in flight must not have the
                     # new version credited with verdicts the old one produced.
                     scorer.version_id,
+                    credential_id,
+                    generation_credential,
                 )
             )
 
     with get_pool().connection() as conn, conn.cursor() as cur:
         cur.executemany(
             "INSERT INTO scores (id, project_id, scorer_id, target_kind, run_id, "
-            "run_item_id, trace_id, span_id, prompt_version_id, status) "
-            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')",
+            "run_item_id, trace_id, span_id, prompt_version_id, credential_id, "
+            "generation_credential, status) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending')",
             params,
         )
     return pairs
@@ -866,6 +852,7 @@ def _execute_job(
     trace_id: str,
     root_name: str,
     root_attributes: dict[str, Any],
+    credential: Credential,
 ) -> None:
     """Run every (scorer, target) pair and emit one trace for the job.
 
@@ -877,6 +864,11 @@ def _execute_job(
     root_span_id = _hex(8)
     spans: list[Span] = []
     spans_lock = threading.Lock()
+
+    # Tagged onto the root span and every judge span below, so "what did this
+    # key cost me?" is answerable from the trace store as well as from the
+    # scores table. The name, never the key.
+    root_attributes = {**root_attributes, "obs.credential": credential.name}
 
     def work(pair: tuple[Scorer, _Target]) -> bool:
         scorer, target = pair
@@ -890,6 +882,7 @@ def _execute_job(
                 input_text=target.input,
                 output_text=target.output,
                 expected=target.expected,
+                api_key=credential.secret,
             )
         except Exception as exc:
             meta.setdefault("end_nano", time.time_ns())
@@ -1013,7 +1006,13 @@ def check_run_scoring_budget(item_count: int, scorer_count: int) -> None:
         )
 
 
-def score_run(project_id: str, run_id: str, scorer_ids: list[str], writer: SpanWriter) -> int:
+def score_run(
+    project_id: str,
+    run_id: str,
+    scorer_ids: list[str],
+    writer: SpanWriter,
+    credential: Credential,
+) -> int:
     """Score every succeeded item of a run. Returns the number of judge calls.
 
     Only succeeded items with output are scored. A failed replay item has
@@ -1027,7 +1026,12 @@ def score_run(project_id: str, run_id: str, scorer_ids: list[str], writer: SpanW
 
     with get_pool().connection() as conn:
         run = conn.execute(
-            "SELECT id, name, trace_id FROM runs WHERE id = %s AND project_id = %s",
+            """
+            SELECT r.id, r.name, r.trace_id, COALESCE(pc.name, '')
+            FROM runs r
+            LEFT JOIN provider_credentials pc ON pc.id = r.credential_id
+            WHERE r.id = %s AND r.project_id = %s
+            """,
             (run_id, project_id),
         ).fetchone()
         if run is None:
@@ -1064,6 +1068,11 @@ def score_run(project_id: str, run_id: str, scorer_ids: list[str], writer: SpanW
         targets=targets,
         target_kind="run_item",
         run_id=run_id,
+        credential_id=credential.id,
+        # run[3] is the run's own key, deliberately not `credential`: a run
+        # re-scored later with a different key was still generated by the one
+        # it recorded at creation.
+        generation_credential=run[3],
     )
 
     trace_id = _hex(16)
@@ -1075,6 +1084,7 @@ def score_run(project_id: str, run_id: str, scorer_ids: list[str], writer: SpanW
             trace_id=trace_id,
             root_name=f"eval scoring {run[1] or run_id[:8]}",
             root_attributes={"obs.run_id": run_id},
+            credential=credential,
         ),
         f"score-{run_id[:8]}",
     )
@@ -1090,6 +1100,8 @@ def score_span(
     output_text: str,
     scorer_ids: list[str],
     writer: SpanWriter,
+    credential: Credential,
+    generation_credential: str = "",
 ) -> list[str]:
     """Score a single span from a trace. Returns the new score ids.
 
@@ -1119,6 +1131,8 @@ def score_span(
         ],
         target_kind="span",
         run_id=None,
+        credential_id=credential.id,
+        generation_credential=generation_credential,
     )
 
     judge_trace_id = _hex(16)
@@ -1130,6 +1144,7 @@ def score_span(
             trace_id=judge_trace_id,
             root_name=f"span scoring {span_id}",
             root_attributes={"obs.target_trace_id": trace_id, "obs.target_span_id": span_id},
+            credential=credential,
         ),
         f"score-span-{span_id[:8]}",
     )
@@ -1144,6 +1159,7 @@ def try_scorer(
     output_text: str,
     expected: str | None,
     writer: SpanWriter,
+    credential: Credential,
 ) -> dict[str, Any]:
     """One judge call against ad-hoc text, run synchronously and not persisted.
 
@@ -1166,9 +1182,15 @@ def try_scorer(
     span_id = _hex(8)
     meta: dict[str, Any] = {"start_nano": time.time_ns()}
 
+    extra = {"obs.scorer_try": True, "obs.credential": credential.name}
+
     try:
         result, meta = judge(
-            scorer, input_text=input_text, output_text=output_text, expected=expected
+            scorer,
+            input_text=input_text,
+            output_text=output_text,
+            expected=expected,
+            api_key=credential.secret,
         )
     except Exception as exc:
         meta.setdefault("end_nano", time.time_ns())
@@ -1184,7 +1206,7 @@ def try_scorer(
                     meta=meta,
                     result=None,
                     error=message,
-                    extra={"obs.scorer_try": True},
+                    extra=extra,
                 )
             ]
         )
@@ -1198,7 +1220,7 @@ def try_scorer(
         span_id=span_id,
         meta=meta,
         result=result,
-        extra={"obs.scorer_try": True},
+        extra=extra,
     )
     writer.append([span])
 
@@ -1267,6 +1289,89 @@ def _score_dict(r: tuple[Any, ...]) -> dict[str, Any]:
         "prompt_version_id": str(r[22]) if r[22] else None,
         "scorer_version": r[23],
     }
+
+
+def average_by_scorer(
+    project_id: str, hours: int = 24, credential: str | None = None
+) -> list[dict[str, Any]]:
+    """Each scorer's headline number over a time window.
+
+    Three things this deliberately does not do.
+
+    **It does not average across output types.** summarize() already explains
+    why: a mean over a 1-5 faithfulness scale and a 0-1 pass rate are different
+    quantities, and putting them in one column produces a number that renders
+    convincingly and means nothing. Each row carries its own type and the
+    caller renders it on its own scale.
+
+    **It does not count a re-scored item twice.** Scoring a run again is
+    allowed and keeps its history, so the raw table holds several verdicts for
+    the same target. DISTINCT ON takes the newest per (scorer, target), the
+    same rule scores_for_run uses — without it, re-scoring one run quietly
+    reweights the whole average toward whatever that run happens to contain.
+
+    **It does not filter by source.** A score has no service.name: it belongs
+    to the judge, not to the application whose output was judged. The window
+    and the provider key are the two filters that genuinely apply.
+    """
+    where = [
+        "sc.project_id = %s",
+        "sc.status = 'succeeded'",
+        "sc.created_at >= now() - make_interval(hours => %s)",
+    ]
+    params: list[Any] = [project_id, hours]
+    if credential:
+        # The key that produced the judged output, not the one that paid the
+        # judge. "How good is what key A produces" is a question about the
+        # generation; grading it with a different key does not change the
+        # answer. Matched on name, which is also what a span records.
+        where.append("sc.generation_credential = %s")
+        params.append(credential)
+
+    sql = f"""
+    WITH latest AS (
+        SELECT DISTINCT ON (
+                   sc.scorer_id,
+                   COALESCE(sc.run_item_id, sc.trace_id || ':' || sc.span_id)
+               )
+               sc.scorer_id, sc.value, sc.passed, sc.label
+        FROM scores sc
+        WHERE {" AND ".join(where)}
+        ORDER BY sc.scorer_id,
+                 COALESCE(sc.run_item_id, sc.trace_id || ':' || sc.span_id),
+                 sc.created_at DESC
+    )
+    SELECT s.id, s.name, s.output_type, s.score_min, s.score_max, s.pass_threshold,
+           COUNT(*) AS scored,
+           AVG(l.value) AS mean,
+           AVG(CASE WHEN l.passed IS NULL THEN NULL
+                    WHEN l.passed THEN 1.0 ELSE 0.0 END) AS pass_rate,
+           MODE() WITHIN GROUP (ORDER BY l.label) AS top_label
+    FROM scorers s
+    JOIN latest l ON l.scorer_id = s.id
+    WHERE s.archived_at IS NULL
+    GROUP BY s.id, s.name, s.output_type, s.score_min, s.score_max, s.pass_threshold
+    ORDER BY s.name
+    """
+
+    with get_pool().connection() as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    return [
+        {
+            "scorer_id": str(r[0]),
+            "scorer_name": r[1],
+            "output_type": r[2],
+            "score_min": float(r[3]) if r[3] is not None else None,
+            "score_max": float(r[4]) if r[4] is not None else None,
+            "pass_threshold": float(r[5]) if r[5] is not None else None,
+            "scored": int(r[6]),
+            "mean": float(r[7]) if r[7] is not None else None,
+            "pass_rate": float(r[8]) if r[8] is not None else None,
+            "top_label": r[9] or "",
+        }
+        for r in rows
+    ]
 
 
 def scores_for_run(run_id: str) -> list[dict[str, Any]]:

@@ -1,9 +1,18 @@
 "use client";
 
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { Suspense, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { Shell } from "./shell";
-import { api, formatCost, formatDurationLong, type Overview } from "@/lib/api";
+import { ModelMix } from "@/components/model-mix";
+import { ScoreAverages } from "@/components/score-averages";
+import { CredentialFilter, useCredentialParam } from "@/components/source-filter";
+import {
+  api,
+  formatCostLong,
+  formatCountLong,
+  formatDurationLong,
+  type Overview,
+} from "@/lib/api";
 
 // CLAUDE.md rules out a *landing* page — marketing, sign-up, the public front
 // door. This is the opposite of that: an in-app overview behind the auth gate,
@@ -12,15 +21,29 @@ import { api, formatCost, formatDurationLong, type Overview } from "@/lib/api";
 export default function HomePage() {
   return (
     <Shell>
-      <Dashboard />
+      {/* useSearchParams needs a Suspense boundary above it or the page
+          cannot be prerendered. */}
+      <Suspense fallback={null}>
+        <Dashboard />
+      </Suspense>
     </Shell>
   );
 }
 
 function Dashboard() {
+  const [credential, setCredential] = useCredentialParam();
+
   const { data, isLoading, isError, isFetching } = useQuery({
-    queryKey: ["overview", 24],
-    queryFn: () => api.overview(24),
+    // The credential is part of the key, so switching it reads from cache when
+    // it can and refetches when it can't, instead of showing one key's numbers
+    // under another's label.
+    //
+    // No source filter on this page: which API key paid is the question this
+    // dashboard answers, and service.name was a second axis that only muddied
+    // it. Traces still carries it, where "which app emitted this" is the
+    // question actually being asked.
+    queryKey: ["overview", 24, credential],
+    queryFn: () => api.overview(24, "", credential),
     refetchInterval: 30_000,
     // Hold the previous render across a refetch rather than dropping back to
     // the loading state — a chart that blinks every 30s is unreadable.
@@ -36,21 +59,30 @@ function Dashboard() {
 
   return (
     <div className={`space-y-4 transition-opacity ${isFetching ? "opacity-60" : ""}`}>
-      <div className="flex items-baseline justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <h1 className="text-base font-semibold">Overview</h1>
-        <p className="text-xs text-neutral-500">Last {data.window_hours} hours</p>
+        <div className="flex flex-wrap items-center gap-2.5">
+          <CredentialFilter value={credential} onChange={setCredential} />
+          <p className="text-xs text-neutral-500">Last {data.window_hours} hours</p>
+        </div>
       </div>
 
       {/* Three across at every size. These are short numbers, and stacking them
           on a phone would push the chart — the thing worth scrolling to —
           below the fold. */}
       <dl className="grid grid-cols-3 gap-2 sm:gap-3">
-        <StatTile label="Prompts run" value={data.prompts.toLocaleString()} />
+        <StatTile label="Prompts run" value={formatCountLong(data.prompts)} />
         <StatTile label="Time in model" value={formatDurationLong(data.duration_ms)} />
-        <StatTile label="Cost" value={formatCost(data.cost_usd)} />
+        <StatTile label="Cost" value={formatCostLong(data.cost_usd)} />
       </dl>
 
       <PromptsChart data={data} />
+
+      {/* Two cards, one row on anything wider than a phone. */}
+      <div className="grid gap-4 sm:grid-cols-2">
+        <ModelMix data={data} />
+        <ScoreAverages hours={24} credential={credential} />
+      </div>
     </div>
   );
 }
@@ -307,7 +339,12 @@ function PromptsChart({ data }: { data: Overview }) {
 
       <p className="mt-1 text-[11px] text-neutral-500">
         {peak === 0
-          ? "No prompts in this window."
+          ? // Names the key when one is selected. "No prompts in this window"
+            // over a filtered view reads as "nothing is running" when what it
+            // means is "not this key".
+            data.credential
+            ? `No prompts on ${data.credential} in this window.`
+            : "No prompts in this window."
           : `Latest hour ${last.prompts.toLocaleString()} · peak ${peak.toLocaleString()}`}
       </p>
 

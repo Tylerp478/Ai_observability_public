@@ -54,6 +54,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+from obs_backend import credentials
 from obs_backend.db import get_pool
 from obs_backend.models import Span
 from obs_backend.scoring import Scorer, ScorerError, get_scorer, judge, judge_span
@@ -318,7 +319,7 @@ def archive_guardrail(project_id: str, guardrail_id: str) -> bool:
 
 _GUARDRAIL_COLUMNS = (
     "g.id, g.name, g.description, g.scorer_id, g.action, g.block_labels, "
-    "g.on_error, g.enabled, g.created_at, "
+    "g.on_error, g.enabled, g.created_at, g.credential_id, "
     "s.name, s.output_type, s.score_min, s.score_max, s.pass_threshold, "
     "s.categories, s.model"
 )
@@ -335,13 +336,16 @@ def _guardrail_dict(r: tuple[Any, ...]) -> dict[str, Any]:
         "on_error": r[6],
         "enabled": r[7],
         "created_at": r[8].isoformat() if r[8] else None,
-        "scorer_name": r[9],
-        "output_type": r[10],
-        "score_min": float(r[11]) if r[11] is not None else None,
-        "score_max": float(r[12]) if r[12] is not None else None,
-        "pass_threshold": float(r[13]) if r[13] is not None else None,
-        "categories": json.loads(r[14] or "[]"),
-        "model": r[15],
+        # Null means "whatever the project default is when this fires", which
+        # is the right behaviour for a rule configured once and left running.
+        "credential_id": str(r[9]) if r[9] else None,
+        "scorer_name": r[10],
+        "output_type": r[11],
+        "score_min": float(r[12]) if r[12] is not None else None,
+        "score_max": float(r[13]) if r[13] is not None else None,
+        "pass_threshold": float(r[14]) if r[14] is not None else None,
+        "categories": json.loads(r[15] or "[]"),
+        "model": r[16],
     }
 
 
@@ -381,7 +385,7 @@ def list_guardrails(project_id: str) -> list[dict[str, Any]]:
         ).fetchall()
 
     return [
-        {**_guardrail_dict(r), "check_count": r[16], "trigger_count": r[17]}
+        {**_guardrail_dict(r), "check_count": r[17], "trigger_count": r[18]}
         for r in rows
     ]
 
@@ -480,11 +484,16 @@ def evaluate(
             return _error_result(guardrail, span_id, "Scorer is no longer available")
 
         try:
+            # Resolved per guardrail, inside the try: a missing or undecryptable
+            # key is a judge failure like any other, so on_error decides what it
+            # means rather than it taking down the whole check.
+            credential = credentials.resolve(project_id, guardrail.get("credential_id"))
             result, meta = judge(
                 scorer,
                 input_text=input_text,
                 output_text=output,
                 expected=None,
+                api_key=credential.secret,
                 timeout=GUARDRAIL_TIMEOUT_SECONDS,
             )
         except Exception as exc:

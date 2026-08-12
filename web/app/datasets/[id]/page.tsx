@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useState } from "react";
 import { Shell } from "../../shell";
+import { CredentialPicker } from "@/components/credential-picker";
 import {
   api,
   ApiError,
@@ -142,6 +143,7 @@ function RunForm({
   const [maxTokensOverride, setMaxTokensOverride] = useState<number | null>(null);
   const [name, setName] = useState("");
   const [scorerIds, setScorerIds] = useState<string[]>([]);
+  const [credentialId, setCredentialId] = useState("");
   // "" means an ad-hoc prompt typed below. Otherwise a saved prompt id, with
   // `pick` naming which of its versions — see PROMPT_PICK encoding.
   const [promptId, setPromptId] = useState("");
@@ -162,6 +164,7 @@ function RunForm({
     enabled: open,
   });
   const savedPrompts = promptData?.prompts ?? [];
+
 
   const { data: selectedPrompt } = useQuery({
     queryKey: ["prompt", promptId],
@@ -196,6 +199,8 @@ function RunForm({
         max_tokens: maxTokens,
         name,
         scorer_ids: scorerIds,
+        // Empty means the project default, resolved server-side.
+        credential_id: credentialId || null,
         ...promptRef(promptId, pick),
       }),
     onSuccess: (run) => {
@@ -416,6 +421,12 @@ function RunForm({
               </div>
             </div>
           )}
+
+          <CredentialPicker
+            value={credentialId}
+            onChange={setCredentialId}
+            label="Bill to"
+          />
 
           {start.isError && (
             <p className="text-xs text-red-400">
