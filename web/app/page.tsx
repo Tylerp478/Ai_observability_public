@@ -6,6 +6,7 @@ import { Shell } from "./shell";
 import { ModelMix } from "@/components/model-mix";
 import { ScoreAverages } from "@/components/score-averages";
 import { CredentialFilter, useCredentialParam } from "@/components/source-filter";
+import { TopTraces } from "@/components/top-traces";
 import {
   api,
   formatCostLong,
@@ -83,6 +84,10 @@ function Dashboard() {
         <ModelMix data={data} />
         <ScoreAverages hours={24} credential={credential} />
       </div>
+
+      {/* Full width and last: the rows carry long names and a link each, so
+          this wants the whole measure rather than half of it. */}
+      <TopTraces data={data} />
     </div>
   );
 }

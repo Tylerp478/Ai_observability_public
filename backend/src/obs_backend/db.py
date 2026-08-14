@@ -550,6 +550,23 @@ ALTER TABLE scores ADD COLUMN IF NOT EXISTS generation_credential TEXT NOT NULL 
 
 CREATE INDEX IF NOT EXISTS scores_generation_credential_idx
     ON scores(project_id, generation_credential, created_at DESC);
+
+-- Whether the Playground offers this scorer. Presentation, not definition: it
+-- says nothing about how the judge scores, so it is deliberately NOT part of
+-- the prompt version config — toggling it must not mint a new version and
+-- must not change the meaning of any score already taken.
+--
+-- Added nullable, backfilled, then made NOT NULL, rather than added with a
+-- DEFAULT: the backfill is a judgement about existing rows (a scorer needing
+-- {{expected}} has nothing to compare against in the Playground, where there
+-- is no golden answer), and it must run exactly once. Once the column is NOT
+-- NULL the UPDATE matches nothing, so re-applying SCHEMA on the next boot
+-- cannot re-hide a scorer that has since been switched back on.
+ALTER TABLE scorers ADD COLUMN IF NOT EXISTS show_in_playground BOOLEAN;
+UPDATE scorers SET show_in_playground = (position('{{expected}}' in prompt_template) = 0)
+    WHERE show_in_playground IS NULL;
+ALTER TABLE scorers ALTER COLUMN show_in_playground SET DEFAULT TRUE;
+ALTER TABLE scorers ALTER COLUMN show_in_playground SET NOT NULL;
 """
 
 

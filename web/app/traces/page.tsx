@@ -6,11 +6,16 @@ import { Suspense } from "react";
 import { Shell } from "../shell";
 import {
   CredentialFilter,
+  SortPicker,
   SourceFilter,
+  StatusFilter,
+  useClearParams,
   useCredentialParam,
+  useSortParam,
   useSourceParam,
+  useStatusParam,
 } from "@/components/source-filter";
-import { api, formatCost, formatDuration, relativeTime } from "@/lib/api";
+import { api, categoryLabel, formatCost, formatDuration, relativeTime } from "@/lib/api";
 
 export default function TracesPage() {
   return (
@@ -27,15 +32,24 @@ export default function TracesPage() {
 function TraceList() {
   const [source, setSource] = useSourceParam();
   const [credential, setCredential] = useCredentialParam();
+  const [status, setStatus] = useStatusParam();
+  const [sort, setSort] = useSortParam();
+  const clearParams = useClearParams();
 
   const { data, isLoading, isError } = useQuery({
-    queryKey: ["traces", source, credential],
-    queryFn: () => api.traces(50, source, credential),
+    queryKey: ["traces", source, credential, status, sort],
+    queryFn: () => api.traces(50, source, credential, status, sort),
     refetchInterval: 10_000,
   });
 
   const traces = data?.traces ?? [];
   const totalCost = traces.reduce((sum, t) => sum + t.cost_usd, 0);
+  const filtered = Boolean(source || credential || status);
+
+  // One call, not three setters — see useClearParams. Sort is deliberately
+  // absent: it hides nothing, so clearing it would undo a choice the user did
+  // not complain about.
+  const clearFilters = () => clearParams(["source", "credential", "status"]);
 
   // The header renders in every state, including empty. An early return for
   // "no traces" would take the source picker off the page at exactly the
@@ -43,16 +57,27 @@ function TraceList() {
   // except editing the URL.
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
+      <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h1 className="text-base font-semibold">Traces</h1>
-        <div className="flex flex-wrap items-center gap-2.5">
-          <CredentialFilter value={credential} onChange={setCredential} />
-          <SourceFilter value={source} onChange={setSource} />
-          {!isLoading && !isError && (
-            <p className="text-xs text-neutral-500">
-              {traces.length} · {formatCost(totalCost)} total
-            </p>
-          )}
+        {!isLoading && !isError && (
+          <p className="text-xs text-neutral-500">
+            {traces.length} · {formatCost(totalCost)} total
+          </p>
+        )}
+      </div>
+
+      {/* Their own row rather than crowding the title. Four controls plus a
+          count do not fit beside a heading on a 375px phone, and wrapping them
+          around it interleaves the count between two selects. */}
+      <div className="flex flex-wrap items-center gap-2">
+        <CredentialFilter value={credential} onChange={setCredential} />
+        <SourceFilter value={source} onChange={setSource} />
+        <StatusFilter value={status} onChange={setStatus} />
+        {/* Pushed to the far end on a wide screen: sort is not a filter, and
+            the gap is what says so. Falls back into the flow when the row
+            wraps. */}
+        <div className="sm:ml-auto">
+          <SortPicker value={sort} onChange={setSort} />
         </div>
       </div>
 
@@ -65,16 +90,24 @@ function TraceList() {
 
       {!isLoading && !isError && traces.length === 0 && (
         <div className="rounded-xl border border-dashed border-neutral-800 px-6 py-12 text-center">
-          {source || credential ? (
+          {filtered ? (
             <>
               <p className="text-sm text-neutral-300">
-                No traces from {[source, credential].filter(Boolean).join(" · ")}
+                No traces matching{" "}
+                {[
+                  source,
+                  credential,
+                  status === "error"
+                    ? "errors only"
+                    : status === "ok"
+                      ? "no errors"
+                      : "",
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
               </p>
               <button
-                onClick={() => {
-                  setSource("");
-                  setCredential("");
-                }}
+                onClick={clearFilters}
                 className="mt-3 rounded-lg border border-neutral-700 px-2.5 py-1 text-xs text-neutral-400 hover:border-neutral-500 hover:text-neutral-200"
               >
                 Clear filters
@@ -110,6 +143,16 @@ function TraceList() {
                         ERROR
                       </span>
                     ) : null}
+                    {/* Promoted out of the metadata line below, where it was
+                        plain grey text in fourth position. Which subsystem ran
+                        a trace is the first thing you want to know about it —
+                        a judge call and a playground call are different kinds
+                        of thing, not different values of one. */}
+                    {t.service_name && (
+                      <span className="shrink-0 rounded bg-neutral-800 px-1.5 py-0.5 text-[10px] text-neutral-300">
+                        {categoryLabel(t.service_name)}
+                      </span>
+                    )}
                     <span className="truncate text-sm font-medium">{t.root_name}</span>
                   </div>
                   <p className="mt-1 truncate font-mono text-[11px] text-neutral-500">
@@ -134,7 +177,6 @@ function TraceList() {
                     {t.input_tokens} in / {t.output_tokens} out
                   </span>
                 )}
-                {t.service_name && <span className="truncate">{t.service_name}</span>}
               </div>
             </Link>
           </li>

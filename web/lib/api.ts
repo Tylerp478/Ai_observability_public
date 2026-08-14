@@ -96,6 +96,26 @@ export interface Overview {
    * breakdown whose whole job is "what did I run".
    */
   models: { model: string; prompts: number; cost_usd: number }[];
+  /**
+   * The ten most expensive traces in the same window, filters and currency as
+   * the totals above. Free traces are omitted, so this can be shorter than ten
+   * — including $0.00 rows to reach a round number would imply the tail costs
+   * something.
+   */
+  top_traces: TopTrace[];
+}
+
+export interface TopTrace {
+  trace_id: string;
+  /** The root span's name — what the trace was. */
+  root_name: string;
+  /** service.name: which subsystem or application did the work. */
+  category: string;
+  start_time_unix_nano: number;
+  span_count: number;
+  cost_usd: number;
+  input_tokens: number;
+  output_tokens: number;
 }
 
 /**
@@ -285,6 +305,9 @@ export interface Scorer {
   score_max: number | null;
   categories: string[];
   pass_threshold: number | null;
+  /** Whether the Playground offers this scorer. Not part of the definition —
+   *  it changes where the scorer is presented, not how it judges. */
+  show_in_playground: boolean;
   created_at?: string | null;
   score_count?: number;
   /** The versioned artifact behind this definition (step 5). */
@@ -528,10 +551,12 @@ export interface TryScorerResult {
 
 // The editable definition. prompt_id and version are excluded along with the
 // other server-owned fields: they describe where the history lives, and the
-// form neither sets them nor should be able to.
+// form neither sets them nor should be able to. show_in_playground is excluded
+// for a different reason — it has its own endpoint, because changing it must
+// not append a version to the scorer's history.
 export type ScorerDraft = Omit<
   Scorer,
-  "id" | "created_at" | "score_count" | "prompt_id" | "version"
+  "id" | "created_at" | "score_count" | "prompt_id" | "version" | "show_in_playground"
 >;
 
 // Declared here rather than beside RUN_MODELS below: SCORER_PRESETS
@@ -750,11 +775,17 @@ export const api = {
         (credential ? `&credential=${encodeURIComponent(credential)}` : ""),
     ),
 
-  traces: (limit = 50, source = "", credential = "") =>
+  // `status` and `sort` go to the server rather than being applied to the
+  // response: the result is capped at `limit`, so reordering or filtering here
+  // would describe one page of recent traces while claiming to describe all of
+  // them.
+  traces: (limit = 50, source = "", credential = "", status = "", sort = "recent") =>
     request<{ traces: TraceSummary[]; count: number }>(
       `/api/traces?limit=${limit}` +
         (source ? `&source=${encodeURIComponent(source)}` : "") +
-        (credential ? `&credential=${encodeURIComponent(credential)}` : ""),
+        (credential ? `&credential=${encodeURIComponent(credential)}` : "") +
+        (status ? `&status=${encodeURIComponent(status)}` : "") +
+        (sort && sort !== "recent" ? `&sort=${encodeURIComponent(sort)}` : ""),
     ),
 
   trace: (id: string) =>
@@ -846,6 +877,13 @@ export const api = {
     request<{ status: string }>(`/api/scorers/${id}`, {
       method: "PATCH",
       body: JSON.stringify({ ...draft, note }),
+    }),
+
+  // Separate from updateScorer so a visibility toggle doesn't append a version.
+  setScorerPlayground: (id: string, show: boolean) =>
+    request<{ status: string }>(`/api/scorers/${id}/playground`, {
+      method: "PATCH",
+      body: JSON.stringify({ show }),
     }),
 
   archiveScorer: (id: string) =>
@@ -1015,6 +1053,22 @@ export function formatDurationLong(ms: number): string {
   if (h > 0) return m > 0 ? `${h}h ${m}m` : `${h}h`;
   if (m > 0) return s > 0 ? `${m}m ${s}s` : `${m}m`;
   return `${s}s`;
+}
+
+/**
+ * Display form of a trace's category — its service.name.
+ *
+ * Strips this app's own `obs-` prefix, which is carried by every internal
+ * subsystem and so distinguishes none of them from each other. An instrumented
+ * application's name passes through untouched.
+ *
+ * Shared by the Overview's cost list and the Traces list so the same trace is
+ * labelled the same way in both. The source dropdown deliberately keeps the raw
+ * name: it is picking a service, and the raw name is what the backend filters
+ * on and what OBS_SERVICE_NAME was set to.
+ */
+export function categoryLabel(serviceName: string): string {
+  return serviceName.replace(/^obs-/, "");
 }
 
 export function formatCost(usd: number): string {

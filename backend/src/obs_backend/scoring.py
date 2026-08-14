@@ -109,6 +109,9 @@ class Scorer:
     score_max: float | None
     categories: list[str]
     pass_threshold: float | None
+    # Whether the Playground offers this scorer. Presentation, not definition:
+    # it is not in the version config, and toggling it appends no version.
+    show_in_playground: bool = True
     # The versioned artifact behind this definition (step 5). Nullable only
     # for the instant between a scorer's insert and its backfill; every scorer
     # created or edited since step 5 has both.
@@ -217,6 +220,7 @@ def create_scorer(
     score_max: float | None = None,
     categories: list[str] | None = None,
     pass_threshold: float | None = None,
+    show_in_playground: bool | None = None,
 ) -> str:
     lo, hi, cats, threshold = _validate_definition(
         name=name,
@@ -230,6 +234,14 @@ def create_scorer(
     )
 
     scorer_id = str(uuid.uuid4())
+
+    # Default the Playground off for a judge that wants a golden answer: the
+    # Playground has no expected output to give it, so it would judge every
+    # response against NO_EXPECTED and report a number that means nothing.
+    # Only the default — the toggle on the Scorers page overrides it either way.
+    if show_in_playground is None:
+        show_in_playground = EXPECTED_PLACEHOLDER not in prompt_template
+
     config = {
         "model": model,
         "max_tokens": max_tokens,
@@ -270,8 +282,8 @@ def create_scorer(
             """
             INSERT INTO scorers (id, project_id, name, description, prompt_template,
                                  model, max_tokens, output_type, score_min, score_max,
-                                 categories, pass_threshold, prompt_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                 categories, pass_threshold, show_in_playground, prompt_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 scorer_id,
@@ -286,6 +298,7 @@ def create_scorer(
                 hi,
                 json.dumps(cats),
                 threshold,
+                show_in_playground,
                 prompt_id,
             ),
         )
@@ -415,6 +428,24 @@ def update_scorer(project_id: str, scorer_id: str, **fields: Any) -> bool:
         return cur.rowcount > 0
 
 
+def set_playground_visibility(project_id: str, scorer_id: str, show: bool) -> bool:
+    """Show or hide a scorer on the Playground.
+
+    Separate from update_scorer on purpose. That path appends a prompt version,
+    which is right for anything that changes how the judge scores and wrong
+    here: whether a scorer appears in one form is not a fact about the judge,
+    and a history full of "toggled visibility" entries buries the edits that
+    actually changed a number.
+    """
+    with get_pool().connection() as conn:
+        cur = conn.execute(
+            "UPDATE scorers SET show_in_playground = %s, updated_at = now() "
+            "WHERE id = %s AND project_id = %s AND archived_at IS NULL",
+            (show, scorer_id, project_id),
+        )
+        return cur.rowcount > 0
+
+
 def archive_scorer(project_id: str, scorer_id: str) -> bool:
     """Soft delete. Scores it produced stay readable and keep their name.
 
@@ -444,7 +475,7 @@ def archive_scorer(project_id: str, scorer_id: str) -> bool:
 _SCORER_COLUMNS = (
     "s.id, s.name, s.description, s.prompt_template, s.model, s.max_tokens, "
     "s.output_type, s.score_min, s.score_max, s.categories, s.pass_threshold, "
-    "s.prompt_id, "
+    "s.show_in_playground, s.prompt_id, "
     "(SELECT pv.id FROM prompt_versions pv WHERE pv.prompt_id = s.prompt_id "
     " ORDER BY pv.version DESC LIMIT 1), "
     "(SELECT MAX(pv.version) FROM prompt_versions pv WHERE pv.prompt_id = s.prompt_id)"
@@ -464,9 +495,10 @@ def _scorer(row: tuple[Any, ...]) -> Scorer:
         score_max=float(row[8]) if row[8] is not None else None,
         categories=json.loads(row[9] or "[]"),
         pass_threshold=float(row[10]) if row[10] is not None else None,
-        prompt_id=str(row[11]) if row[11] else None,
-        version_id=str(row[12]) if row[12] else None,
-        version=row[13],
+        show_in_playground=bool(row[11]),
+        prompt_id=str(row[12]) if row[12] else None,
+        version_id=str(row[13]) if row[13] else None,
+        version=row[14],
     )
 
 
@@ -483,6 +515,7 @@ def scorer_dict(scorer: Scorer) -> dict[str, Any]:
         "score_max": scorer.score_max,
         "categories": scorer.categories,
         "pass_threshold": scorer.pass_threshold,
+        "show_in_playground": scorer.show_in_playground,
         "prompt_id": scorer.prompt_id,
         "version": scorer.version,
     }
@@ -516,8 +549,8 @@ def list_scorers(project_id: str) -> list[dict[str, Any]]:
     return [
         {
             **scorer_dict(_scorer(r)),
-            "created_at": r[14].isoformat() if r[14] else None,
-            "score_count": r[15],
+            "created_at": r[15].isoformat() if r[15] else None,
+            "score_count": r[16],
         }
         for r in rows
     ]

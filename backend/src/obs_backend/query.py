@@ -55,6 +55,26 @@ _SELECT = """
 _CREDENTIAL_EXPR = "json_extract_string(attributes_json, '$.\"obs.credential\"')"
 
 
+# How the trace list can be ordered. A whitelist because ORDER BY cannot be
+# parameterized — the value is interpolated into the SQL, so it must never be
+# anything the caller chose the text of.
+#
+# All three are aggregates over the trace's spans, which is why sorting has to
+# happen in the query rather than in the client: the list is capped at `limit`,
+# so ordering after the cut would mean "the most expensive of the 50 most
+# recent" while presenting itself as "the most expensive".
+TRACE_SORTS = {
+    "recent": "start_time_unix_nano DESC",
+    "duration": "duration_ms DESC",
+    "cost": "cost_usd DESC",
+}
+
+# A trace is errored if ANY of its spans errored, so this is an aggregate and
+# belongs in HAVING, not WHERE. Filtering the spans instead would keep the
+# trace and drop the very span that made it interesting.
+_HAS_ERROR = "MAX(CASE WHEN s.status_code = 'ERROR' THEN 1 ELSE 0 END)"
+
+
 class TraceQuery:
     def __init__(self, storage: StorageBackend) -> None:
         self.storage = storage
@@ -177,6 +197,8 @@ class TraceQuery:
         limit: int = 50,
         source: str | None = None,
         credential: str | None = None,
+        status: str | None = None,
+        sort: str = "recent",
     ) -> list[dict[str, Any]]:
         """One row per trace, rolled up from its spans.
 
@@ -190,6 +212,12 @@ class TraceQuery:
         instrumented app is all itself. If a trace ever spans two services the
         rollups would describe only the filtered half, and this would need to
         become "traces having any span from X" instead.
+
+        `status` is 'error' (traces with at least one failed span), 'ok'
+        (traces with none) or None for both. `sort` is a key of TRACE_SORTS.
+        Both are applied here rather than in the client because `limit` cuts
+        the result: a client-side sort would silently reorder one page of the
+        most recent traces and call it a ranking of all of them.
         """
         relation = self._spans_relation(project_id)
         if relation is None:
@@ -204,6 +232,15 @@ class TraceQuery:
             clauses.append(f"{_CREDENTIAL_EXPR} = ?")
             params.append(credential)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+        # Unknown values fall through to no filter rather than raising. This is
+        # a URL parameter a user can type, and an unreadable 500 is a worse
+        # answer to "?status=oops" than the unfiltered list.
+        having = ""
+        if status == "error":
+            having = f"HAVING {_HAS_ERROR} = 1"
+        elif status == "ok":
+            having = f"HAVING {_HAS_ERROR} = 0"
 
         sql = f"""
         WITH spans AS (SELECT * FROM ({relation}) {where}),
@@ -226,12 +263,13 @@ class TraceQuery:
             SUM(COALESCE(s.gen_ai_usage_output_tokens, 0)) AS output_tokens,
             -- A trace is errored if ANY span errored, not just the root: a
             -- failed tool call the agent recovered from still matters.
-            MAX(CASE WHEN s.status_code = 'ERROR' THEN 1 ELSE 0 END) AS has_error,
+            {_HAS_ERROR} AS has_error,
             ANY_VALUE(s.service_name)             AS service_name
         FROM spans s
         LEFT JOIN roots r ON r.trace_id = s.trace_id
         GROUP BY s.trace_id, r.root_name, r.root_status, r.root_start, r.root_duration_ms
-        ORDER BY start_time_unix_nano DESC
+        {having}
+        ORDER BY {TRACE_SORTS.get(sort, TRACE_SORTS["recent"])}
         LIMIT {int(limit)}
         """
         return self._rows(sql, params)
@@ -256,6 +294,10 @@ class TraceQuery:
         hour, zero-filled. A chart that silently omits quiet hours compresses
         its own time axis and turns a gap in traffic into a straight line
         between two busy points, which is the opposite of what it's for.
+
+        `top_traces` rides along rather than living on its own endpoint: it has
+        to answer for the same window, source and key as the headline cost, and
+        a second endpoint is a second place for those three to drift apart.
         """
         now = int(time.time())
         # Align to the top of the current hour so buckets are wall-clock hours
@@ -271,6 +313,7 @@ class TraceQuery:
             "cost_usd": 0.0,
             "series": [{"hour_start": b, "prompts": 0} for b in buckets],
             "models": [],
+            "top_traces": [],
         }
 
         relation = self._spans_relation(project_id)
@@ -342,6 +385,62 @@ class TraceQuery:
         """
         model_rows = self._rows(model_sql, params)
 
+        # The ten traces that cost the most in this window, with the category
+        # of work each one was.
+        #
+        # A trace rather than a span, because a span is not a unit anybody
+        # recognises — "this eval run cost 3c" is actionable and "this chat
+        # span cost 3c" is not. Costs are summed over the trace's spans, which
+        # is the same population the headline cost figure uses: cost only ever
+        # accrues on chat spans, so including the rest adds nothing but keeps
+        # the rollup honest if that ever changes.
+        #
+        # The category is service.name — the only categorical axis a trace
+        # has, and one that happens to separate exactly the things worth
+        # separating when money is the question: obs-judge, obs-runner,
+        # obs-playground and obs-guardrail are this app's own subsystems, and
+        # anything else is an instrumented application. It needs no mapping
+        # table here, so a new service starts appearing the day it first
+        # reports rather than the day someone remembers to add it.
+        #
+        # HAVING > 0 drops free traces. A list of the ten most expensive
+        # things padded out with $0.00 rows implies the tail costs something.
+        top_sql = f"""
+        WITH spans AS ({relation}),
+        deduped AS (
+            SELECT * FROM (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY span_id) AS rn
+                FROM spans
+            ) WHERE rn = 1
+        ),
+        scoped AS (
+            SELECT * FROM deduped
+            WHERE start_time_unix_nano >= ?
+              {"AND service_name = ?" if source else ""}
+              {f"AND {_CREDENTIAL_EXPR} = ?" if credential else ""}
+        ),
+        roots AS (
+            SELECT trace_id, name AS root_name
+            FROM scoped WHERE parent_span_id IS NULL OR parent_span_id = ''
+        )
+        SELECT
+            s.trace_id,
+            COALESCE(NULLIF(r.root_name, ''), 'unknown')      AS root_name,
+            COALESCE(NULLIF(ANY_VALUE(s.service_name), ''), 'unknown') AS category,
+            MIN(s.start_time_unix_nano)                       AS start_time_unix_nano,
+            COUNT(*)                                          AS span_count,
+            SUM(COALESCE(s.obs_cost_usd, 0))                  AS cost_usd,
+            SUM(COALESCE(s.gen_ai_usage_input_tokens, 0))     AS input_tokens,
+            SUM(COALESCE(s.gen_ai_usage_output_tokens, 0))    AS output_tokens
+        FROM scoped s
+        LEFT JOIN roots r ON r.trace_id = s.trace_id
+        GROUP BY s.trace_id, r.root_name
+        HAVING SUM(COALESCE(s.obs_cost_usd, 0)) > 0
+        ORDER BY cost_usd DESC
+        LIMIT 10
+        """
+        top_rows = self._rows(top_sql, params)
+
         by_hour = {int(r["hour_start"]): r for r in rows}
         return {
             "window_hours": hours,
@@ -366,6 +465,19 @@ class TraceQuery:
                     "cost_usd": float(r["cost_usd"] or 0),
                 }
                 for r in model_rows
+            ],
+            "top_traces": [
+                {
+                    "trace_id": r["trace_id"],
+                    "root_name": r["root_name"],
+                    "category": r["category"],
+                    "start_time_unix_nano": int(r["start_time_unix_nano"] or 0),
+                    "span_count": int(r["span_count"]),
+                    "cost_usd": float(r["cost_usd"] or 0),
+                    "input_tokens": int(r["input_tokens"] or 0),
+                    "output_tokens": int(r["output_tokens"] or 0),
+                }
+                for r in top_rows
             ],
         }
 

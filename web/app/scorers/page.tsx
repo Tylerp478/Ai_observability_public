@@ -50,7 +50,8 @@ Record passed = true if the answer is acceptable.`,
   pass_threshold: null,
 };
 
-/** Strip the server-owned fields, leaving only what the form edits. */
+/** Strip the server-owned fields, leaving only what the form edits.
+ *  show_in_playground goes with them — it has its own control and endpoint. */
 function toDraft(scorer: Scorer): ScorerDraft {
   return {
     name: scorer.name,
@@ -82,7 +83,8 @@ function Scorers() {
         <p className="mt-1 text-xs text-neutral-500">
           A scorer is a prompt, a model, and an output schema. The judge answers
           through a forced tool call, so every score comes back typed rather than
-          as prose.
+          as prose. &ldquo;In playground&rdquo; picks which of them the Playground
+          offers — runs against a dataset can still use any of them.
         </p>
       </div>
 
@@ -204,6 +206,7 @@ function ScorerRow({ scorer, onChanged }: { scorer: Scorer; onChanged: () => voi
             {mode === "history" ? "Close" : `History (${scorer.version})`}
           </button>
         )}
+        <PlaygroundToggle scorer={scorer} onChanged={onChanged} />
         <button
           onClick={() => archive.mutate()}
           disabled={archive.isPending}
@@ -243,6 +246,52 @@ function ScorerRow({ scorer, onChanged }: { scorer: Scorer; onChanged: () => voi
         </div>
       )}
     </li>
+  );
+}
+
+/**
+ * Whether the Playground offers this scorer.
+ *
+ * Not part of the editor, and not saved with the definition: it changes where
+ * a scorer is presented rather than how it judges, so putting it through the
+ * edit form would append a version recording that nothing about the judge
+ * changed. Its own endpoint, its own control, no version.
+ *
+ * A judge that wants {{expected}} is the case this exists for — the Playground
+ * has no golden answer to hand it, so it would score every response against
+ * nothing and report a number that looks real.
+ */
+function PlaygroundToggle({
+  scorer,
+  onChanged,
+}: {
+  scorer: Scorer;
+  onChanged: () => void;
+}) {
+  const toggle = useMutation({
+    mutationFn: (show: boolean) => api.setScorerPlayground(scorer.id, show),
+    onSuccess: onChanged,
+  });
+
+  const needsExpected = scorer.prompt_template.includes(EXPECTED_PLACEHOLDER);
+
+  return (
+    <label
+      title={
+        needsExpected
+          ? `This judge asks for ${EXPECTED_PLACEHOLDER}, which the Playground has no value for.`
+          : "Offer this scorer on the Playground."
+      }
+      className="flex cursor-pointer items-center gap-1.5 text-[11px] text-neutral-400 hover:text-neutral-200"
+    >
+      <input
+        type="checkbox"
+        checked={scorer.show_in_playground}
+        disabled={toggle.isPending}
+        onChange={(e) => toggle.mutate(e.target.checked)}
+      />
+      In playground
+    </label>
   );
 }
 

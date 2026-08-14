@@ -52,7 +52,11 @@ function Playground() {
   const [result, setResult] = useState<PlaygroundResult | null>(null);
 
   const { data: scorerData } = useQuery({ queryKey: ["scorers"], queryFn: api.scorers });
-  const scorers = scorerData?.scorers ?? [];
+  // Filtered rather than showing everything: a judge that wants an expected
+  // output has nothing to compare against here, and offering it would produce a
+  // score that looks like a verdict on the answer. Which scorers belong is a
+  // per-scorer decision, made on the Scorers page.
+  const scorers = (scorerData?.scorers ?? []).filter((s) => s.show_in_playground);
 
   const send = useMutation<PlaygroundResult>({
     mutationFn: () =>
@@ -136,6 +140,19 @@ function Playground() {
             />
           </label>
         </div>
+
+        {/* Only when there are scorers but none of them are offered here.
+            Otherwise this reads as "you have no scorers", which is a different
+            problem with a different fix. */}
+        {scorers.length === 0 && (scorerData?.scorers.length ?? 0) > 0 && (
+          <p className="text-[11px] text-neutral-500">
+            No scorers are set to show here.{" "}
+            <Link href="/scorers" className="text-sky-400 hover:underline">
+              Pick some on the Scorers page
+            </Link>
+            .
+          </p>
+        )}
 
         {scorers.length > 0 && (
           <div>

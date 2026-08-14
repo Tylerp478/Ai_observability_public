@@ -330,12 +330,19 @@ def list_traces(
     limit: int = 50,
     source: str = "",
     credential: str = "",
+    status: str = "",
+    sort: str = "recent",
 ) -> dict[str, Any]:
     traces = _query.list_traces(
         project_id,
         limit=min(limit, 500),
         source=source or None,
         credential=credential or None,
+        # 'error' | 'ok' | anything else for both. Not validated into a 400:
+        # these arrive from a URL the user can edit, and the query treats an
+        # unrecognised value as no filter.
+        status=status or None,
+        sort=sort,
     )
     return {"traces": traces, "count": len(traces)}
 
@@ -751,6 +758,10 @@ class ScorerRequest(BaseModel):
     note: str = ""
 
 
+class PlaygroundVisibilityRequest(BaseModel):
+    show: bool
+
+
 class TryScorerRequest(BaseModel):
     output: str
     input: str = ""
@@ -829,6 +840,24 @@ def update_scorer(
     except ScorerError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not updated:
+        raise HTTPException(status_code=404, detail="Scorer not found")
+    return {"status": "updated"}
+
+
+@app.patch("/api/scorers/{scorer_id}/playground")
+def set_scorer_playground(
+    scorer_id: str,
+    body: PlaygroundVisibilityRequest,
+    project_id: Annotated[str, Depends(require_any_auth)],
+) -> dict[str, str]:
+    """Show or hide a scorer on the Playground.
+
+    Its own route rather than a field on PATCH /scorers/{id}: that one appends
+    a prompt version, and where a scorer is offered is not a change to how it
+    judges. Keeping them apart is what stops a visibility toggle from showing
+    up in the version history as if the definition had moved.
+    """
+    if not scoring.set_playground_visibility(project_id, scorer_id, body.show):
         raise HTTPException(status_code=404, detail="Scorer not found")
     return {"status": "updated"}
 

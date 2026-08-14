@@ -41,6 +41,31 @@ function useFilterParam(key: string): [string, (next: string) => void] {
   return [value, setValue];
 }
 
+/**
+ * Clear several filters in one navigation.
+ *
+ * Not a loop over the individual setters. Each of those builds its next URL
+ * from the `params` it captured at render, so calling three in a row starts all
+ * three from the same snapshot and only the last one survives — which reads as
+ * "Clear filters cleared one filter and put the others back". One
+ * URLSearchParams, one replace, no interleaving.
+ */
+export function useClearParams(): (keys: string[]) => void {
+  const params = useSearchParams();
+  const router = useRouter();
+  const pathname = usePathname();
+
+  return useCallback(
+    (keys: string[]) => {
+      const query = new URLSearchParams(params.toString());
+      for (const key of keys) query.delete(key);
+      const qs = query.toString();
+      router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+    },
+    [params, pathname, router],
+  );
+}
+
 export function useSourceParam(): [string, (next: string) => void] {
   return useFilterParam("source");
 }
@@ -56,6 +81,83 @@ export function useSourceParam(): [string, (next: string) => void] {
  */
 export function useCredentialParam(): [string, (next: string) => void] {
   return useFilterParam("credential");
+}
+
+/** Whether to show only errored traces, only clean ones, or both. */
+export function useStatusParam(): [string, (next: string) => void] {
+  return useFilterParam("status");
+}
+
+/**
+ * Which order the trace list comes back in.
+ *
+ * A URL param like the filters, and for the same reasons — but it is not a
+ * filter, and the UI keeps it visually apart so nobody reads "highest cost" as
+ * "only expensive ones".
+ */
+export function useSortParam(): [string, (next: string) => void] {
+  return useFilterParam("sort");
+}
+
+// Shared by both selects below and by the source and credential pickers above.
+const SELECT =
+  "max-w-[190px] truncate rounded-lg border border-neutral-700 bg-neutral-950 px-2.5 py-1.5 text-xs text-neutral-300 outline-none focus:border-neutral-500";
+
+/**
+ * Error filter.
+ *
+ * Three states rather than a checkbox. "Only errors" is the common one, but
+ * "no errors" earns its place next to a cost sort: the most expensive trace in
+ * a window is often an expensive failure, and hiding those is how you find the
+ * most expensive thing that actually worked.
+ */
+export function StatusFilter({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  return (
+    <label className="flex items-center gap-2">
+      <span className="sr-only">Filter by status</span>
+      <select value={value} onChange={(e) => onChange(e.target.value)} className={SELECT}>
+        <option value="">All statuses</option>
+        <option value="error">Errors only</option>
+        <option value="ok">No errors</option>
+      </select>
+    </label>
+  );
+}
+
+/**
+ * Sort order. The backend owns the ordering — see TRACE_SORTS in query.py —
+ * so these values are the contract and not just labels.
+ */
+export function SortPicker({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  return (
+    <label className="flex items-center gap-1.5">
+      {/* Visible label, unlike the filters. Without it a select reading
+          "Most recent" is indistinguishable from a filter that shows only
+          recent traces. */}
+      <span className="text-[11px] text-neutral-500">Sort</span>
+      <select
+        value={value || "recent"}
+        onChange={(e) => onChange(e.target.value === "recent" ? "" : e.target.value)}
+        className={SELECT}
+      >
+        <option value="recent">Most recent</option>
+        <option value="duration">Longest run time</option>
+        <option value="cost">Highest cost</option>
+      </select>
+    </label>
+  );
 }
 
 /**
@@ -97,7 +199,7 @@ export function SourceFilter({
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="max-w-[190px] truncate rounded-lg border border-neutral-700 bg-neutral-950 px-2.5 py-1.5 text-xs text-neutral-300 outline-none focus:border-neutral-500"
+        className={SELECT}
       >
         <option value="">All sources</option>
         {sources.map((s) => (
@@ -152,7 +254,7 @@ export function CredentialFilter({
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="max-w-[190px] truncate rounded-lg border border-neutral-700 bg-neutral-950 px-2.5 py-1.5 text-xs text-neutral-300 outline-none focus:border-neutral-500"
+        className={SELECT}
       >
         <option value="">All keys</option>
         {credentials.map((c) => (
