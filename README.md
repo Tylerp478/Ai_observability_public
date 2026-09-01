@@ -1,5 +1,7 @@
 # AI Observability
 
+Added in v1.2 - Grok and Gemini models and connections. 
+
 A prototype AI observability platform — trace capture, evals, LLM-as-judge
 scoring, prompt versioning, and real-time guardrails — built to explore what
 actually differs between observing an LLM application and observing a
