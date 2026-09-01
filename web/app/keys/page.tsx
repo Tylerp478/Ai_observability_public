@@ -5,6 +5,8 @@ import Link from "next/link";
 import { useState } from "react";
 import { Shell } from "../shell";
 import { api, ApiError, formatCost, relativeTime } from "@/lib/api";
+import { AdminOnly } from "@/components/admin-only";
+import { useProviderLabel } from "@/lib/use-models";
 
 /**
  * Two things that both look like "connections", kept visibly separate.
@@ -78,11 +80,14 @@ function Collapsible({
 export default function KeysPage() {
   return (
     <Shell>
-      <div className="space-y-6">
-        <ProviderKeys />
-        <Keys />
-        <Sources />
-      </div>
+      <AdminOnly hint="Provider keys, ingest keys and projects live here. Ask an admin if you need something changed.">
+        <div className="space-y-6">
+          <ProviderKeys />
+          <Keys />
+          <Sources />
+          <Projects />
+        </div>
+      </AdminOnly>
     </Shell>
   );
 }
@@ -255,8 +260,9 @@ function ProviderKeys() {
     queryFn: api.providers,
   });
   const providers = providerData?.providers ?? [];
-  const providerLabel = (p: string) =>
-    providers.find((x) => x.name === p)?.label ?? p;
+  // Shared with the credential picker, so a provider is called the same thing
+  // where you create a key and where you choose one to spend on.
+  const providerLabel = useProviderLabel();
 
   const { data, isLoading } = useQuery({
     queryKey: ["credentials"],
@@ -447,6 +453,181 @@ function ProviderKeys() {
  * backend's own LLM traffic, and they are listed rather than hidden because
  * they cost real money on the same key.
  */
+
+/**
+ * The projects this backend holds, and the only place to add one.
+ *
+ * Last on the page on purpose. Everything above it — provider keys, ingest
+ * keys, sources — describes the project currently selected in the header, and
+ * a control that changes *which* project that is belongs after the things it
+ * scopes rather than before them.
+ *
+ * The counts are what make the list worth reading: a project with no keys is
+ * one that cannot spend and cannot receive, which is the usual state of a
+ * project someone made and forgot. Span volume is deliberately not among them
+ * — see `projects.py` — so nothing here costs a scan of the span store.
+ *
+ * **Renaming, but no deleting.** A project's id is what every span partition
+ * on disk is named for, and Postgres would cascade where the object store
+ * cannot, so a delete would leave Parquet files belonging to a project no
+ * lookup could name again. Renaming covers the case that actually comes up.
+ */
+function Projects() {
+  const qc = useQueryClient();
+  const [name, setName] = useState("");
+  const [editing, setEditing] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+
+  const { data, isLoading } = useQuery({ queryKey: ["projects"], queryFn: api.projects });
+
+  const create = useMutation({
+    mutationFn: (n: string) => api.createProject(n),
+    onSuccess: () => {
+      setName("");
+      qc.invalidateQueries({ queryKey: ["projects"] });
+    },
+  });
+
+  const rename = useMutation({
+    mutationFn: ({ id, next }: { id: string; next: string }) =>
+      api.renameProject(id, next),
+    onSuccess: () => {
+      setEditing(null);
+      qc.invalidateQueries({ queryKey: ["projects"] });
+    },
+  });
+
+  const projects = data?.projects ?? [];
+  const current = data?.current ?? "";
+
+  return (
+    <Collapsible
+      title="Projects"
+      hint="what everything else is scoped to"
+      count={projects.length}
+    >
+      <p className="text-xs text-neutral-500">
+        A project keeps its own traces, datasets, scorers, prompts and keys. Use
+        one per application you want billed and evaluated separately — to tell
+        apart apps that share an eval suite, set a different source name in the
+        SDK instead. Switch projects from the header.
+      </p>
+
+      {isLoading ? (
+        <p className="text-xs text-neutral-500">Loading…</p>
+      ) : (
+        <ul className="space-y-2">
+          {projects.map((p) => (
+            <li
+              key={p.id}
+              className="rounded-xl border border-neutral-800 bg-neutral-950/40 px-3.5 py-3"
+            >
+              {editing === p.id ? (
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (draft.trim()) rename.mutate({ id: p.id, next: draft.trim() });
+                  }}
+                  className="flex gap-2"
+                >
+                  <input
+                    value={draft}
+                    onChange={(e) => setDraft(e.target.value)}
+                    autoFocus
+                    className="min-w-0 flex-1 rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-1.5 text-sm outline-none focus:border-neutral-500"
+                  />
+                  <button
+                    type="submit"
+                    disabled={rename.isPending || !draft.trim()}
+                    className="shrink-0 rounded-lg btn-primary px-2.5 py-1.5 text-xs font-medium disabled:opacity-40"
+                  >
+                    Save
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setEditing(null)}
+                    className="shrink-0 rounded-lg px-2.5 py-1.5 text-xs text-neutral-400"
+                  >
+                    Cancel
+                  </button>
+                </form>
+              ) : (
+                <div className="flex items-center gap-2">
+                  <span className="truncate text-sm font-medium">{p.name}</span>
+                  {p.id === current && (
+                    <span className="rounded bg-sky-900 px-1.5 py-0.5 text-[10px] font-medium text-sky-300">
+                      CURRENT
+                    </span>
+                  )}
+                  <button
+                    onClick={() => {
+                      setEditing(p.id);
+                      setDraft(p.name);
+                    }}
+                    className="ml-auto shrink-0 rounded-lg border border-neutral-700 px-2.5 py-1 text-[11px] text-neutral-300"
+                  >
+                    Rename
+                  </button>
+                </div>
+              )}
+              <p className="mt-1 font-mono text-[11px] text-neutral-500">
+                {p.ingest_keys} ingest {p.ingest_keys === 1 ? "key" : "keys"} ·{" "}
+                {p.provider_keys} provider{" "}
+                {p.provider_keys === 1 ? "key" : "keys"} · {p.datasets}{" "}
+                {p.datasets === 1 ? "dataset" : "datasets"}
+              </p>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      {rename.isError && (
+        <p className="text-xs text-red-400">
+          {rename.error instanceof ApiError
+            ? rename.error.message
+            : "Could not rename the project."}
+        </p>
+      )}
+
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (name.trim()) create.mutate(name.trim());
+        }}
+        className="flex gap-2"
+      >
+        <input
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Project name (e.g. staging)"
+          className="min-w-0 flex-1 rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm outline-none focus:border-neutral-500"
+        />
+        <button
+          type="submit"
+          disabled={create.isPending || !name.trim()}
+          className="shrink-0 rounded-lg btn-primary px-3 py-2 text-sm font-medium disabled:opacity-40"
+        >
+          Create
+        </button>
+      </form>
+
+      {create.isError && (
+        <p className="text-xs text-red-400">
+          {create.error instanceof ApiError
+            ? create.error.message
+            : "Could not create the project."}
+        </p>
+      )}
+
+      <p className="text-[11px] text-neutral-600">
+        A new project starts empty — no provider key, no scorers. Add a key to
+        it before running anything, or the run will have nothing to spend.
+      </p>
+    </Collapsible>
+  );
+}
+
+
 function Sources() {
   const { data, isLoading } = useQuery({ queryKey: ["sources"], queryFn: api.sources });
   const sources = data?.sources ?? [];

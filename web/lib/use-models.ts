@@ -63,3 +63,27 @@ export function useModels(credentialId?: string): string[] {
   const models = providers.filter((p) => held.has(p.name)).flatMap((p) => p.models);
   return models.length > 0 ? models : [...FALLBACK_MODELS];
 }
+
+/**
+ * What a provider is called, for display.
+ *
+ * A credential stores the registry's `name` — "anthropic", "xai", "google" —
+ * which is a routing key, not a label. Anywhere a key's provider is shown to a
+ * person it should read the way the vendor writes it, and from one definition,
+ * so the Keys page and the credential picker cannot end up calling the same
+ * provider two different things.
+ *
+ * Falls back to the raw name until `/api/providers` answers. That is
+ * unprettified rather than wrong — the same string, lowercased — so a slow
+ * fetch never briefly attributes a key to the wrong vendor.
+ */
+export function useProviderLabel(): (name: string) => string {
+  const { data } = useQuery({
+    queryKey: ["providers"],
+    queryFn: api.providers,
+    staleTime: 5 * 60_000,
+  });
+
+  const providers = data?.providers ?? [];
+  return (name: string) => providers.find((p) => p.name === name)?.label ?? name;
+}

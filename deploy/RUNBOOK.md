@@ -139,6 +139,15 @@ Everything else (`OBS_HOST`, `OBS_DATABASE_URL`, `OBS_DATA_DIR`,
 `OBS_COOKIE_SECURE`) is set by `compose.yaml` and will override whatever `.env`
 says, so leave those alone.
 
+> **If you deploy without compose**, `OBS_COOKIE_SECURE` now defaults to
+> `true`, so a live host gets HTTPS-only session cookies even if nobody sets
+> the variable. And `config.py::check_cookie_security` refuses to boot on a
+> non-loopback bind with it turned off — the same fail-closed treatment
+> `ADMIN_PASSWORD` gets, and for the same reason: the bind address is what
+> decides whether the exposure is real. Serving plain HTTP on a LAN you trust
+> is still possible, it just has to be said out loud with
+> `OBS_ALLOW_INSECURE_COOKIES=true`.
+
 > **`ADMIN_PASSWORD` is enforced, not advisory.** Compose sets
 > `OBS_HOST=0.0.0.0`, and `config.py::check_password_strength` refuses to boot
 > on a non-loopback bind with a password under 8 characters or one on the

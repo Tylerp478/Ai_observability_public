@@ -1,10 +1,11 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
-import { useEffect } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
+import { PROJECT_PARAM, currentProjectId, setCurrentProjectId } from "@/lib/project";
 
 /**
  * Auth gate plus chrome for signed-in pages.
@@ -57,6 +58,8 @@ export function Shell({ children }: { children: React.ReactNode }) {
     );
   }
 
+  const isAdmin = data?.role === "admin";
+
   const nav = [
     { href: "/", label: "Overview" },
     { href: "/traces", label: "Traces" },
@@ -65,8 +68,20 @@ export function Shell({ children }: { children: React.ReactNode }) {
     { href: "/prompts", label: "Prompts" },
     { href: "/scorers", label: "Scorers" },
     { href: "/guardrails", label: "Guardrails" },
+    // Both admin-only, and hidden rather than disabled: the backend refuses
+    // to list what either page shows for a viewer, so a nav item leading only
+    // to 403s is worse than no nav item.
+    //
     // "Keys" rather than "API keys", and the page itself says what kind.
-    { href: "/keys", label: "Keys" },
+    // People is separate because it is the only screen about *people* rather
+    // than about credentials, and because revoking someone should not be
+    // three clicks deep on a page about API keys.
+    ...(isAdmin
+      ? [
+          { href: "/keys", label: "Keys" },
+          { href: "/people", label: "People" },
+        ]
+      : []),
   ];
 
   // Initials for the header avatar. The local part is all we have — an email
@@ -108,9 +123,12 @@ export function Shell({ children }: { children: React.ReactNode }) {
             </span>
           </div>
 
-          <span className="rounded-md bg-neutral-800 px-2.5 py-[3px] text-[11px] text-neutral-100">
-            Local
-          </span>
+          {/* useSearchParams needs a Suspense boundary above it or the page
+              cannot be prerendered — and this one sits in the shell, so every
+              page would inherit the problem. */}
+          <Suspense fallback={null}>
+            <ProjectPicker />
+          </Suspense>
 
           <span
             title={data?.email}
@@ -160,12 +178,137 @@ export function Shell({ children }: { children: React.ReactNode }) {
         <div className="hr-fade" />
       </header>
 
-      <main className="mx-auto w-full max-w-5xl flex-1 px-4 py-5">{children}</main>
+      <main className="mx-auto w-full max-w-5xl flex-1 px-4 py-5">
+        {/* Said once, at the top, rather than repeated as a tooltip on every
+            disabled control. A viewer should learn the shape of their access
+            in one sentence instead of discovering it one greyed-out button at
+            a time. */}
+        {data && !isAdmin && (
+          <p className="mb-4 rounded-xl border border-neutral-800 bg-neutral-900/40 px-3.5 py-2.5 text-xs text-neutral-400">
+            <span className="font-medium text-neutral-200">Read-only access.</span>{" "}
+            You can see everything here. Running, editing and anything that
+            spends money are an admin&apos;s to do.
+          </p>
+        )}
+        {children}
+      </main>
 
       <footer className="px-4 pb-6 text-center text-[11px] text-neutral-600">
         {data?.email}
       </footer>
     </div>
+  );
+}
+
+/** Drop every answer that was given for the previous project, and refetch
+ *  whatever is on screen. Everything except the projects list itself, which is
+ *  the same list from inside any of them. */
+function resetProjectScopedQueries(qc: QueryClient) {
+  qc.resetQueries({ predicate: (q) => q.queryKey[0] !== "projects" });
+  qc.invalidateQueries({ queryKey: ["projects"] });
+}
+
+/**
+ * Which project everything on the page belongs to.
+ *
+ * In the header rather than on a settings page because it scopes every number
+ * below it. It sits where the "Local" chip did — that chip said the same thing
+ * on every deploy of this app, and the space is better spent on the one label
+ * that changes what the page means.
+ *
+ * **Rendered even with a single project**, for the reason the credential
+ * picker is: with one project this is not a choice, it is the disclosure of
+ * which project the spend on screen belongs to. It renders disabled so it
+ * reads as a fact rather than a control that does nothing.
+ *
+ * **Switching resets the query cache.** Query keys here do not carry the
+ * project, so a cached `["overview", 24]` from the old project would render
+ * under the new project's name — the exact wrong number under a confident
+ * label. `reset` rather than `invalidate`: invalidating refetches but keeps
+ * serving the old answer until the new one lands, which is precisely the
+ * mislabelled number, just for a shorter time. `clear` is wrong in the other
+ * direction — it empties the cache without asking anything to refetch, so the
+ * page simply keeps whatever it had.
+ *
+ * The projects list is the one query deliberately left out of that: it is not
+ * project-scoped, it answers the same either way, and blanking it would
+ * unmount this control mid-switch.
+ *
+ * Switching also strips `?project=` from the URL. Nothing reads it after the
+ * first fetch of a page load (see `lib/project.ts`), so this is only to stop a
+ * later reload of that URL from re-adopting a project the user has since
+ * switched away from.
+ */
+function ProjectPicker() {
+  const qc = useQueryClient();
+  const router = useRouter();
+  const pathname = usePathname();
+  const params = useSearchParams();
+
+  const { data } = useQuery({
+    queryKey: ["projects"],
+    queryFn: api.projects,
+    staleTime: 30_000,
+  });
+
+  const projects = data?.projects ?? [];
+  const current = data?.current ?? "";
+  const stored = typeof window === "undefined" ? "" : currentProjectId();
+
+  // What the select shows. Local state so the label moves on click rather
+  // than a round trip later; `current` is the authority once it catches up.
+  const [selected, setSelected] = useState<string | null>(null);
+
+  // Recovery only: adopt the backend's answer when what is stored names no
+  // project it knows about — a client carrying an id from before a database
+  // was reset, where every other route is 400ing and this is what ends it.
+  //
+  // **Never when the stored id is valid**, even if it disagrees with `current`.
+  // They disagree for a moment after every switch, because `current` is still
+  // the previous answer until the refetch lands, and an earlier version that
+  // adopted on any mismatch used that moment to undo the switch: stripping
+  // `?project=` remounts this component, the effect re-ran against the stale
+  // value, and the selection reverted to the project the user had just left.
+  const known = projects.some((p) => p.id === stored);
+  useEffect(() => {
+    if (!current || known) return;
+    setCurrentProjectId(current);
+    resetProjectScopedQueries(qc);
+  }, [current, known, qc]);
+
+  if (projects.length === 0) return null;
+
+  const switchTo = (id: string) => {
+    setSelected(id);
+    setCurrentProjectId(id);
+    resetProjectScopedQueries(qc);
+    if (params.get(PROJECT_PARAM)) {
+      const query = new URLSearchParams(params.toString());
+      query.delete(PROJECT_PARAM);
+      const qs = query.toString();
+      router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+    }
+  };
+
+  return (
+    <select
+      value={selected ?? current}
+      onChange={(e) => switchTo(e.target.value)}
+      disabled={projects.length === 1}
+      title={
+        projects.length === 1
+          ? "Add a project on the Keys page to work in more than one"
+          : "The project every number on this page belongs to"
+      }
+      aria-label="Project"
+      className="max-w-[150px] truncate rounded-md bg-neutral-800 px-2 py-[3px] text-[11px] text-neutral-100 outline-none focus:ring-1 focus:ring-sky-700 disabled:opacity-70"
+    >
+      {projects.map((p) => (
+        <option key={p.id} value={p.id}>
+          {p.name}
+        </option>
+      ))}
+    </select>
   );
 }
 

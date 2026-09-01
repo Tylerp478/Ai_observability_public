@@ -57,20 +57,35 @@ class Settings(BaseSettings):
     admin_email: str = Field(default="", alias="ADMIN_EMAIL")
     admin_password: str = Field(default="", alias="ADMIN_PASSWORD")
 
-    # Cookies are marked Secure by default. Set false only for plain-HTTP
-    # localhost development — a Secure cookie is dropped by the browser over
-    # http://, which presents as "login succeeds then immediately bounces back
-    # to the login page" and is genuinely nasty to diagnose.
-    cookie_secure: bool = Field(default=False, alias="OBS_COOKIE_SECURE")
-    # "lax" for same-origin dev. Cross-site (frontend and backend on different
-    # domains, e.g. behind a tunnel) requires "none", which the browser only
-    # honours together with Secure.
+    # Cookies are marked Secure by default, and the default is the safe
+    # direction on purpose: forgetting this variable on a live host yields a
+    # cookie that only travels over HTTPS, while forgetting it locally yields
+    # an immediate, loud, documented failure. It used to default to False,
+    # which meant a deployment that was not `compose.yaml` shipped session
+    # cookies over plain HTTP and said nothing.
+    #
+    # Set false only for plain-HTTP local development — a Secure cookie is
+    # dropped by the browser over http://, which presents as "login succeeds
+    # then immediately bounces back to the login page" and is genuinely nasty
+    # to diagnose.
+    cookie_secure: bool = Field(default=True, alias="OBS_COOKIE_SECURE")
+    # "lax" for same-origin dev, and same-origin is also what a live
+    # deployment gets: `next.config.ts` proxies /api through the frontend, so
+    # there is one origin and "lax" stays correct. Cross-site (frontend and
+    # backend on genuinely different domains) requires "none", which the
+    # browser only honours together with Secure.
     cookie_samesite: str = Field(default="lax", alias="OBS_COOKIE_SAMESITE")
+    # Only consulted when the frontend and backend are on different origins.
+    # With the proxy in front, nothing cross-origin reaches the backend, which
+    # is why the localhost default survives a live deployment unchanged.
     cors_origins: str = Field(default="http://localhost:3000", alias="OBS_CORS_ORIGINS")
 
     # Bind address. The weak-password guard keys off this.
     host: str = Field(default="127.0.0.1", alias="OBS_HOST")
     allow_weak_password: bool = Field(default=False, alias="OBS_ALLOW_WEAK_PASSWORD")
+    allow_insecure_cookies: bool = Field(
+        default=False, alias="OBS_ALLOW_INSECURE_COOKIES"
+    )
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -111,6 +126,57 @@ class Settings(BaseSettings):
                 "ADMIN_EMAIL and ADMIN_PASSWORD must be set — the UI has no other "
                 "way to create the first user. Set them in the repo-root .env."
             )
+
+    def check_cookie_security(self) -> None:
+        """Refuse to listen on a non-loopback address with a cleartext cookie.
+
+        The same shape as `check_password_strength`, and for the same reason:
+        the bind address is the fact that decides whether an exposure is real,
+        so keying off it beats a warning somebody has to remember to act on. A
+        session cookie without `Secure` is sent over plain HTTP, where anything
+        on the path can lift it and become that user — including, now, an admin
+        who can add provider keys and spend money.
+
+        Two failures, not one. The second is the subtle one: browsers reject
+        `SameSite=None` outright unless `Secure` is also set, so that pairing
+        does not weaken the cookie, it discards it — login appears to succeed
+        and every call afterwards 401s, which looks like a backend bug rather
+        than a config one. It is checked on every host, loopback included,
+        because the browser does not care where the server is.
+
+        `OBS_ALLOW_INSECURE_COOKIES=true` overrides the first check, for
+        deliberately serving plain HTTP on a trusted LAN — a phone on your own
+        Wi-Fi, say. It cannot override the second, because that one is not a
+        risk judgement: it is a combination that simply does not work.
+        """
+        if self.cookie_samesite.lower() == "none" and not self.cookie_secure:
+            raise RuntimeError(
+                "OBS_COOKIE_SAMESITE=none requires OBS_COOKIE_SECURE=true.\n"
+                "\n"
+                "Browsers discard a SameSite=None cookie that is not Secure, so "
+                "login would appear to work and every request afterwards would "
+                "return 401."
+            )
+
+        if self.allow_insecure_cookies:
+            return
+        if self.cookie_secure:
+            return
+        if self.host in {"127.0.0.1", "localhost", "::1"}:
+            return
+
+        raise RuntimeError(
+            f"OBS_COOKIE_SECURE is false while binding to {self.host}.\n"
+            "\n"
+            "The session cookie would travel in cleartext, so anything on the "
+            "network path could replay it and become that user.\n"
+            "\n"
+            "  - Serving over HTTPS (a live URL, a tunnel): set "
+            "OBS_COOKIE_SECURE=true.\n"
+            "  - Deliberately serving plain HTTP on a trusted LAN: set "
+            "OBS_ALLOW_INSECURE_COOKIES=true to accept that.\n"
+            "  - Local development: bind to 127.0.0.1 instead."
+        )
 
     def check_password_strength(self) -> None:
         """Refuse to listen on a non-loopback address with a guessable password.

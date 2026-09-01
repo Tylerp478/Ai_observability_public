@@ -12,7 +12,14 @@
 // first-party. Set NEXT_PUBLIC_API_BASE only when the backend really is on a
 // different origin — that also needs SameSite=None, Secure, and the backend's
 // CORS allowlist.
+import { currentProjectId } from "@/lib/project";
+
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
+
+/** Names the project every call is scoped to. See `lib/project.ts` for why
+ *  this is a header the client sets rather than a cookie the browser sends:
+ *  a cookie would ride along on requests that never chose a project. */
+const PROJECT_HEADER = "X-Obs-Project";
 
 export class ApiError extends Error {
   constructor(
@@ -24,6 +31,7 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const project = currentProjectId();
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
     credentials: "include",
@@ -37,6 +45,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     cache: "no-store",
     headers: {
       "Content-Type": "application/json",
+      // Every call, not just the reads: creating a dataset or a key has to
+      // land in the project on screen, and a write that ignored the selector
+      // would silently populate whichever project the backend defaults to.
+      ...(project ? { [PROJECT_HEADER]: project } : {}),
       ...(init?.headers ?? {}),
     },
   });
@@ -202,6 +214,54 @@ export interface Source {
  * there is no reason to show it again, because nothing outside the backend
  * ever needs it.
  */
+/** What someone may do. `viewer` reads everything and writes nothing; `admin`
+ *  does everything. A third role — spend, but no admin surfaces — is deferred
+ *  until someone needs it. */
+export type Role = "admin" | "viewer";
+
+/**
+ * A row on the allowlist, which is not the same thing as a user.
+ *
+ * The row exists from the moment they are invited, so a pending invite is
+ * something you can see and revoke rather than an email you have to remember
+ * sending. `accepted_at` is what separates "invited" from "has an account".
+ */
+export interface Person {
+  email: string;
+  /** What the admin typed, available before they have ever signed in. */
+  name: string;
+  role: Role;
+  note: string;
+  added_at: string | null;
+  accepted_at: string | null;
+  revoked_at: string | null;
+  invite_expires_at: string | null;
+  invite_pending: boolean;
+  /** An outstanding reset link. They can still sign in with the old password
+   *  until it is used, which is why this is not the same as "invited". */
+  reset_pending: boolean;
+  /** Last activity, not last login — sessions renew for 30 days, so a login
+   *  date would badly understate how current someone is. Null once their
+   *  sessions age out. */
+  last_seen_at: string | null;
+}
+
+/**
+ * A project: the boundary datasets, scorers, prompts, keys and spans all sit
+ * inside. Switching changes what exists, not what is shown — see the backend's
+ * `projects.py` for why there is no across-projects view.
+ */
+export interface Project {
+  id: string;
+  name: string;
+  created_at: string | null;
+  /** Counts, so a picker can say which projects are actually in use rather
+   *  than making you switch into each one to find out. */
+  ingest_keys: number;
+  provider_keys: number;
+  datasets: number;
+}
+
 export interface Credential {
   id: string;
   name: string;
@@ -796,7 +856,8 @@ export const api = {
 
   logout: () => request<{ status: string }>("/api/auth/logout", { method: "POST" }),
 
-  me: () => request<{ email: string; user_id: string }>("/api/auth/me"),
+  me: () =>
+    request<{ email: string; user_id: string; role: Role }>("/api/auth/me"),
 
   sources: () => request<{ sources: Source[] }>("/api/sources"),
 
@@ -809,6 +870,64 @@ export const api = {
     ),
 
   // --- provider keys ---
+  /** Also reports which project the backend resolved this call to, so a
+   *  client holding an id that no longer exists can notice and adopt the
+   *  answer instead of 400ing on every other route. */
+  people: () =>
+    request<{ people: Person[]; roles: Role[] }>("/api/people"),
+
+  /** Returns the invite token exactly once — there is no way to read it back,
+   *  by design, the same as an ingest key. */
+  invitePerson: (body: { email: string; name: string; role: Role; note: string }) =>
+    request<{ email: string; token: string }>("/api/people", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  setPersonRole: (email: string, role: Role) =>
+    request<{ email: string; role: Role }>(
+      `/api/people/${encodeURIComponent(email)}`,
+      { method: "PATCH", body: JSON.stringify({ role }) },
+    ),
+
+  /** A single-use link to set a new password. Returned once, like an invite —
+   *  the backend stores only its hash. */
+  resetPersonPassword: (email: string) =>
+    request<{ email: string; token: string }>(
+      `/api/people/${encodeURIComponent(email)}/reset`,
+      { method: "POST" },
+    ),
+
+  revokePerson: (email: string) =>
+    request<{ status: string }>(`/api/people/${encodeURIComponent(email)}`, {
+      method: "DELETE",
+    }),
+
+  /** Public: who a pending invite is for. Gated on holding the token. */
+  checkInvite: (token: string) =>
+    request<{ email: string }>(`/api/auth/invite?token=${encodeURIComponent(token)}`),
+
+  acceptInvite: (token: string, password: string) =>
+    request<{ email: string; role: Role }>("/api/auth/accept", {
+      method: "POST",
+      body: JSON.stringify({ token, password }),
+    }),
+
+  projects: () =>
+    request<{ projects: Project[]; current: string; default: string }>("/api/projects"),
+
+  createProject: (name: string) =>
+    request<{ id: string; name: string }>("/api/projects", {
+      method: "POST",
+      body: JSON.stringify({ name }),
+    }),
+
+  renameProject: (id: string, name: string) =>
+    request<{ id: string; name: string }>(`/api/projects/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ name }),
+    }),
+
   credentials: () => request<{ credentials: Credential[] }>("/api/credentials"),
 
   providers: () =>

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useState } from "react";
 import { Shell } from "../shell";
 import { CredentialPicker } from "@/components/credential-picker";
+import { useRole } from "@/lib/use-role";
 import { useModels } from "@/lib/use-models";
 import {
   api,
@@ -49,6 +50,7 @@ function Playground() {
   const [maxTokens, setMaxTokens] = useState(1024);
   const [scorerIds, setScorerIds] = useState<string[]>([]);
   const [credentialId, setCredentialId] = useState("");
+  const { isAdmin } = useRole();
   const [result, setResult] = useState<PlaygroundResult | null>(null);
 
   // Only the models the selected key can actually serve. Derived rather than
@@ -198,7 +200,10 @@ function Playground() {
         <div className="flex items-center gap-3">
           <button
             onClick={() => send.mutate()}
-            disabled={!prompt.trim() || !effectiveModel || send.isPending}
+            disabled={
+              !isAdmin || !prompt.trim() || !effectiveModel || send.isPending
+            }
+            title={isAdmin ? undefined : "Read-only access — running a prompt spends money"}
             className="rounded-lg btn-primary px-3 py-1.5 text-xs font-medium disabled:opacity-40"
           >
             {send.isPending ? "Running…" : "Run"}

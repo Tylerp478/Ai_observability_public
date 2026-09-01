@@ -6,6 +6,7 @@ import { useParams, useRouter } from "next/navigation";
 import { useState } from "react";
 import { Shell } from "../../shell";
 import { CredentialPicker } from "@/components/credential-picker";
+import { useRole } from "@/lib/use-role";
 import { useModels } from "@/lib/use-models";
 import {
   api,
@@ -144,6 +145,7 @@ function RunForm({
   const [name, setName] = useState("");
   const [scorerIds, setScorerIds] = useState<string[]>([]);
   const [credentialId, setCredentialId] = useState("");
+  const { isAdmin } = useRole();
   // "" means an ad-hoc prompt typed below. Otherwise a saved prompt id, with
   // `pick` naming which of its versions — see PROMPT_PICK encoding.
   const [promptId, setPromptId] = useState("");
@@ -446,7 +448,8 @@ function RunForm({
           <div className="flex items-center gap-3">
             <button
               type="submit"
-              disabled={missingPlaceholder || !model || start.isPending}
+              disabled={!isAdmin || missingPlaceholder || !model || start.isPending}
+              title={isAdmin ? undefined : "Read-only access — a run spends money"}
               className="rounded-lg btn-primary px-3 py-1.5 text-xs font-medium disabled:opacity-40"
             >
               {start.isPending ? "Starting…" : `Run ${itemCount} cases`}

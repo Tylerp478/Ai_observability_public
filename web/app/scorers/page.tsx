@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Shell } from "../shell";
 import { CredentialPicker } from "@/components/credential-picker";
+import { useRole } from "@/lib/use-role";
 import { VersionHistory } from "@/components/version-history";
 import {
   api,
@@ -605,6 +606,7 @@ function TryPanel({ scorer }: { scorer: Scorer }) {
   const [output, setOutput] = useState("");
   const [expected, setExpected] = useState("");
   const [credentialId, setCredentialId] = useState("");
+  const { isAdmin } = useRole();
 
   const run = useMutation<TryScorerResult>({
     mutationFn: () =>
@@ -646,7 +648,8 @@ function TryPanel({ scorer }: { scorer: Scorer }) {
         <CredentialPicker value={credentialId} onChange={setCredentialId} compact />
         <button
           onClick={() => run.mutate()}
-          disabled={!output.trim() || run.isPending}
+          disabled={!isAdmin || !output.trim() || run.isPending}
+          title={isAdmin ? undefined : "Read-only access — judging spends money"}
           className="rounded-lg border border-neutral-700 px-2.5 py-1.5 text-[11px] text-neutral-200 disabled:opacity-40"
         >
           {run.isPending ? "Judging…" : "Run once"}

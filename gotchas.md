@@ -364,3 +364,97 @@ still refuses on every path that spends, before any money moves.
 
 **`WATCH` — deps must stay off the iCloud-synced Desktop.**
 Not new, but it still holds: iCloud sync corrupts venvs and `node_modules`.
+
+## A Secure cookie over plain HTTP: login "succeeds", then bounces
+
+**Symptom.** `POST /api/auth/login` returns 200 and sets a cookie you can see
+in the response. Every request after it returns 401 and the UI drops you back
+on the login form, as though the password were wrong. Devtools shows the
+Set-Cookie header, so it looks like the backend is rejecting its own session.
+
+**Cause.** The browser never stored the cookie. `Secure` means HTTPS-only, and
+the page was served over `http://` — so the cookie was discarded on arrival,
+silently, and the next request carried nothing. Nothing in the login response
+indicates this; the server did its job and the browser quietly declined.
+
+**Which way round.**
+
+| Serving over | `OBS_COOKIE_SECURE` |
+|---|---|
+| `http://localhost:3000` (dev) | `false` |
+| `http://<lan-ip>:3000` (phone on your Wi-Fi) | `false`, plus `OBS_ALLOW_INSECURE_COOKIES=true` if the backend also binds non-loopback |
+| any `https://` URL | `true` — or leave it unset, since that is the default |
+
+**Why the default is `true` now.** It used to be `false` while the comment
+above it claimed the opposite, which meant any deployment that was not
+`compose.yaml` shipped cleartext session cookies and said nothing about it.
+Forgetting the variable on a live host now yields a safe cookie; forgetting it
+locally yields this very loud failure, which is the direction you want the
+mistake to point.
+
+**The related trap.** `SameSite=none` without `Secure` is not weaker — it is
+*discarded*, producing exactly the same symptom. `check_cookie_security`
+refuses to boot on that pairing on every host, loopback included, because the
+browser does not care where the server is.
+
+## `next dev` from a phone: the page paints, and nothing works
+
+**Symptom.** Reach the dev server on the machine's LAN address instead of
+`localhost` and the app looks fine — styles, layout, copy, all correct. Then
+nothing that needs JavaScript happens. The login form does nothing when you
+submit it. A page that fetches on mount sits on its loading state forever
+(`Checking your invite…` with an empty account field). No error appears
+anywhere, and the same URL on `localhost` works perfectly.
+
+**Cause.** Next 16 blocks cross-origin dev requests. The HTML is
+server-rendered and served, but the client bundle and the HMR socket are
+refused, so **React never hydrates**. What you are looking at is the SSR
+output, frozen in its initial state — which is exactly why a loading spinner
+never resolves: the query that would end it lives in client code that never
+ran. The console shows repeated
+`WebSocket connection to 'ws://<lan-ip>:3000/_next/webpack-hmr' failed`, which
+reads like a hot-reload annoyance and is actually the whole story.
+
+**Fix.** `allowedDevOrigins` in `web/next.config.ts`. It computes the machine's
+own non-internal IPv4 addresses at startup rather than hardcoding one, because
+a written-down IP goes stale the next time DHCP moves — and it goes stale
+*silently, in the same shape as this bug*.
+
+**Why it is worth knowing.** This mimics an auth problem convincingly. The
+first read of "I could see it on my phone but couldn't log in" is a wrong
+password, and the login-attempts table appears to support that, because a form
+that never hydrated submits nothing at all — so there is no failed attempt
+recorded, and an empty table looks like "you never tried" rather than "the
+button is dead".
+
+**Still expected after the fix.** The HMR websocket keeps failing from a LAN
+origin, so edits do not hot-reload on the phone; reload manually. Hydration —
+the part that matters — works. None of this affects `next build` /
+`next start`, which have no dev-origin restriction at all.
+
+
+## Recovering a component you deleted before writing it out
+
+A refactor that carved `People` out of `keys/page.tsx` wrote the *remainder*
+back to disk and kept the carved-out half only in a Python variable, which
+died with the process. The component had never been committed, so `git` had
+nothing to restore.
+
+It was recoverable from the dev server's **source maps**: Next writes
+`sourcesContent` into `.next/**/*.js.map`, so the pre-edit file was sitting in
+the build output.
+
+```
+python3 - <<'EOF'
+import glob, json
+for path in glob.glob(".next/**/*.js.map", recursive=True):
+    m = json.load(open(path))
+    for src, content in zip(m.get("sources", []), m.get("sourcesContent") or []):
+        if content and src.endswith("app/keys/page.tsx"):
+            print(path, len(content))
+EOF
+```
+
+Pick the longest match — several chunks carry overlapping copies and the
+largest is usually the whole file. This only works until the next build
+overwrites the chunk, so do it before rebuilding.

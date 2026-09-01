@@ -567,6 +567,46 @@ UPDATE scorers SET show_in_playground = (position('{{expected}}' in prompt_templ
     WHERE show_in_playground IS NULL;
 ALTER TABLE scorers ALTER COLUMN show_in_playground SET DEFAULT TRUE;
 ALTER TABLE scorers ALTER COLUMN show_in_playground SET NOT NULL;
+
+-- --- multi-user: an allowlist, and where a role lives -------------------
+-- A pre-authorization, with its own lifecycle: the row exists before the
+-- person has ever touched the app, which is what makes a pending invite
+-- something you can see and revoke rather than an email you have to remember
+-- sending. `users` is still created only when someone actually signs up.
+--
+-- **The role lives here, not on `users`.** That is what lets a demotion take
+-- effect on the next click: every request already has to join this table to
+-- check the person is still allowed in, so reading the role from the same row
+-- costs nothing and cannot drift from it. A `users.role` column would be a
+-- second copy of the answer, and the two would disagree exactly when it
+-- mattered — between a demotion and that user's next login.
+--
+-- Deliberately absent: `google_sub` and `auth_provider`. There is one way in
+-- today, and a column nothing reads is worse than none. They arrive with a
+-- second provider.
+CREATE TABLE IF NOT EXISTS allowed_emails (
+    -- Lowercased before it gets here. The join key against users.email.
+    email        TEXT PRIMARY KEY,
+    -- What YOU type — "Sarah (work)". Available immediately, before they have
+    -- ever logged in, which is the whole reason it is not taken from a login.
+    name         TEXT NOT NULL DEFAULT '',
+    role         TEXT NOT NULL DEFAULT 'viewer',
+    note         TEXT NOT NULL DEFAULT '',
+    added_by     TEXT REFERENCES users(id) ON DELETE SET NULL,
+    added_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- SHA-256 of the one-time invite token, never the token. Same reasoning as
+    -- sessions and api_keys: a database leak must not yield anything
+    -- replayable. Cleared once accepted.
+    invite_hash  TEXT,
+    invite_expires_at TIMESTAMPTZ,
+    accepted_at  TIMESTAMPTZ,
+    -- Soft delete, so revocation is auditable and re-adding someone does not
+    -- lose the note explaining who they were.
+    revoked_at   TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS allowed_emails_invite_idx
+    ON allowed_emails(invite_hash) WHERE invite_hash IS NOT NULL;
 """
 
 

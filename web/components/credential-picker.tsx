@@ -1,7 +1,8 @@
 "use client";
 
 import { useQuery } from "@tanstack/react-query";
-import { api } from "@/lib/api";
+import { api, type Credential } from "@/lib/api";
+import { useProviderLabel } from "@/lib/use-models";
 
 /**
  * "Which key pays for this", shown wherever a call can be started.
@@ -41,12 +42,32 @@ export function CredentialPicker({
     queryFn: api.credentials,
     staleTime: 30_000,
   });
+  const providerLabel = useProviderLabel();
 
   const credentials = data?.credentials ?? [];
   if (credentials.length === 0) return null;
 
   const fallback = credentials.find((c) => c.is_default) ?? credentials[0];
   const single = credentials.length === 1;
+  const selected = credentials.find((c) => c.id === value) ?? fallback;
+
+  /**
+   * "prod · Anthropic" — the key, and the vendor it spends at.
+   *
+   * Which key pays stopped being the whole fact once a key could belong to any
+   * of four providers: two keys named "prod" and "prod-eu" say nothing about
+   * which one can serve the model in the box next to this, and the model list
+   * silently follows the key. Naming the provider makes an empty or shrinking
+   * model dropdown legible instead of surprising.
+   *
+   * In the option text rather than an `<optgroup>` header, even though
+   * grouping would read better while the menu is open: a native select shows
+   * only the chosen option's text once it is closed, and the closed state is
+   * the one you read before pressing Run.
+   */
+  const optionLabel = (c: Credential) =>
+    `${c.name} · ${providerLabel(c.provider)}` +
+    (c.id === fallback.id && !single ? " (default)" : "");
 
   return (
     <label className={compact ? "flex items-center gap-1.5" : "block"}>
@@ -63,27 +84,26 @@ export function CredentialPicker({
         value={value}
         onChange={(e) => onChange(e.target.value)}
         disabled={single}
+        // Always carries the full label, because the compact select truncates
+        // and the provider is the part that falls off the end.
         title={
           single
-            ? "Add another key on the Keys page to choose where a call bills"
-            : undefined
+            ? `${optionLabel(fallback)} — add another key on the Keys page to choose where a call bills`
+            : optionLabel(selected)
         }
         className={`rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-xs outline-none focus:border-neutral-500 disabled:opacity-70 ${
-          compact ? "max-w-[190px] truncate" : "w-full"
+          compact ? "max-w-[230px] truncate" : "w-full"
         }`}
       >
         {/* The default is the empty value, not its id. Sending "" keeps one
             answer to "which key pays" and keeps it server-side, so a default
             changed on the Keys page takes effect without this form knowing. */}
-        <option value="">
-          {fallback.name}
-          {single ? "" : " (default)"}
-        </option>
+        <option value="">{optionLabel(fallback)}</option>
         {credentials
           .filter((c) => c.id !== fallback.id)
           .map((c) => (
             <option key={c.id} value={c.id}>
-              {c.name}
+              {optionLabel(c)}
             </option>
           ))}
       </select>

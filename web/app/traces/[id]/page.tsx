@@ -6,6 +6,7 @@ import { useParams } from "next/navigation";
 import { useMemo, useState } from "react";
 import { Shell } from "../../shell";
 import { CredentialPicker } from "@/components/credential-picker";
+import { useRole } from "@/lib/use-role";
 import {
   api,
   ApiError,
@@ -333,6 +334,7 @@ function ScoreSpan({ span }: { span: Span }) {
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState<string[]>([]);
   const [credentialId, setCredentialId] = useState("");
+  const { isAdmin } = useRole();
 
   const { data } = useQuery({
     queryKey: ["scorers"],
@@ -420,7 +422,8 @@ function ScoreSpan({ span }: { span: Span }) {
             />
             <button
               onClick={() => score.mutate()}
-              disabled={selected.length === 0 || score.isPending}
+              disabled={!isAdmin || selected.length === 0 || score.isPending}
+              title={isAdmin ? undefined : "Read-only access — scoring spends money"}
               className="rounded-lg btn-primary px-2.5 py-1.5 text-[11px] font-medium disabled:opacity-40"
             >
               {score.isPending ? "Starting…" : "Score"}

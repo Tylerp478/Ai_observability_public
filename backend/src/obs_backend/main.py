@@ -29,6 +29,7 @@ from obs_backend import (
     llm,
     otlp,
     playground,
+    projects,
     prompts,
     runner,
     scoring,
@@ -40,6 +41,7 @@ from obs_backend.credentials import CredentialError
 from obs_backend.db import close_pool, get_pool, init_schema
 from obs_backend.guardrails import GuardrailError, GuardrailRateLimited
 from obs_backend.playground import PlaygroundError
+from obs_backend.projects import ProjectError
 from obs_backend.prompts import PromptError
 from obs_backend.query import TraceQuery
 from obs_backend.runner import RunError
@@ -52,18 +54,30 @@ from obs_backend.wal import SpanWriter
 # Reachable without any credential. Kept minimal — everything else is denied.
 PUBLIC_PATHS = {
     "/health",
+    # Redeeming an invite necessarily happens before there is a session. Both
+    # are gated on holding an unexpired single-use token, which is the
+    # credential here.
+    "/api/auth/invite",
+    "/api/auth/accept",
     "/api/auth/login",
     "/docs",
     "/openapi.json",
     "/redoc",
 }
 
+# Writes a viewer must still be able to make. Exactly one: signing out is not
+# a privilege, and a read-only user trapped in a session they cannot end would
+# be a worse outcome than anything this gate prevents.
+WRITE_EXEMPT_PATHS = PUBLIC_PATHS | {"/api/auth/logout"}
+
 _settings = get_settings()
 _storage = build_storage(_settings)
 _writer = SpanWriter(_storage)
 _query = TraceQuery(_storage)
 _stop = threading.Event()
-_admin_project_id = ""
+# The project a request lands in when it names none: a fresh install, a
+# pre-projects client, or the SDK's own bootstrap. Resolved once at boot.
+_default_project_id = ""
 
 
 def _background_loop() -> None:
@@ -76,33 +90,54 @@ def _background_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _admin_project_id
+    global _default_project_id
     _settings.require_secret_key()
-    _settings.require_admin_credentials()
     _settings.check_password_strength()
+    _settings.check_cookie_security()
 
     init_schema()
-    sessions.seed_admin(_settings.admin_email, _settings.admin_password)
+
+    # ADMIN_EMAIL/ADMIN_PASSWORD are a **bootstrap**, not a permanent fixture.
+    # While they are set they are authoritative: the password is re-hashed from
+    # .env on every boot and that address is re-asserted as an un-revoked
+    # admin, which is the escape hatch if the allowlist is ever edited into a
+    # state nobody can sign in from.
+    #
+    # Once a real admin exists — someone who accepted an invite and chose their
+    # own password — they can be removed from .env, and then the only copy of
+    # anyone's password is the argon2 hash in the database. Putting them back
+    # and restarting always works, because this runs every boot.
+    if _settings.admin_email and _settings.admin_password:
+        sessions.seed_admin(_settings.admin_email, _settings.admin_password)
+    elif not sessions.has_active_admin():
+        raise RuntimeError(
+            "No admin exists and ADMIN_EMAIL/ADMIN_PASSWORD are not set.\n"
+            "\n"
+            "The UI has no way to create the first user, so set both in the "
+            "repo-root .env and restart. They can be removed again once "
+            "someone has accepted an admin invite."
+        )
+
     sessions.purge_expired_sessions()
 
     from obs_backend.auth import ensure_project
 
-    _admin_project_id = ensure_project("default")
+    _default_project_id = ensure_project("default")
 
     # The .env key becomes the first stored credential, so an existing install
     # keeps working without anyone having to visit the UI first.
-    if credentials.seed_from_env(_admin_project_id):
+    if credentials.seed_from_env(_default_project_id):
         print("[credentials] adopted ANTHROPIC_API_KEY from .env as the default key")
 
     # Scores and runs from before keys existed belong to the one key that could
     # have made them. No-op once a second key exists.
-    attributed = credentials.backfill_generation_credential(_admin_project_id)
+    attributed = credentials.backfill_generation_credential(_default_project_id)
     if attributed:
         print(f"[credentials] attributed {attributed} earlier score(s) to the only key")
 
     # After seeding, not before: an install whose only key is in .env has one
     # by this point, and warning about it would be a lie.
-    credentials.warn_if_no_keys(_admin_project_id)
+    credentials.warn_if_no_keys(_default_project_id)
 
     # A replay run lives on a thread, so anything still marked running at boot
     # died with the last process. Left alone it would poll forever in the UI.
@@ -146,6 +181,33 @@ async def default_deny(request: Request, call_next):
             content={"detail": "Authentication required"},
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    # Roles are enforced here rather than as a dependency on each write route,
+    # for the same reason the 401 above is: a route added later without the
+    # right decorator must fail closed, not open. Thirty-odd write routes each
+    # needing to remember `Depends(require_admin)` is thirty chances to forget.
+    #
+    # **Only on writes.** A viewer reads everything, so gating GETs would buy
+    # nothing and would put a second session lookup in front of every poll on
+    # a live dashboard. Mutations are rare, so the extra query lands where it
+    # costs nothing.
+    #
+    # Bearer-authenticated requests are untouched: an ingest key is scoped by
+    # its project, has no role, and POSTing spans is its whole purpose.
+    if (
+        not has_bearer
+        and request.method not in ("GET", "HEAD", "OPTIONS")
+        and path not in WRITE_EXEMPT_PATHS
+    ):
+        user = sessions.resolve_session(request.cookies.get(SESSION_COOKIE) or "")
+        if user is not None and not user.is_admin:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "detail": "Read-only access. Ask an admin if you need to "
+                    "run, edit or spend."
+                },
+            )
     return await call_next(request)
 
 
@@ -185,19 +247,51 @@ def require_session(
     return user
 
 
+# Which project a browser request is scoped to. Sent by the web client on
+# every call; absent means the default project, which is what a fresh install
+# and every pre-projects client sees.
+PROJECT_HEADER = "x-obs-project"
+
+
+def _selected_project(request: Request) -> str:
+    """The project a session request asked for, validated.
+
+    A header rather than a cookie, deliberately. A cookie is ambient: it would
+    ride along on ingest and on `curl` calls that never meant to choose a
+    project, and the failure mode of *silently writing to the wrong project* is
+    the one that cannot be undone. A header is chosen per request by the one
+    client that has a project selector.
+
+    An id that names no project is a 400 rather than a fallback to the default.
+    The stale-id case is real — a client can hold a project id from before a
+    database was reset — and quietly answering with a different project's spend
+    is precisely the lie this app exists to not tell.
+    """
+    requested = request.headers.get(PROJECT_HEADER, "").strip()
+    if not requested:
+        return _default_project_id
+    if requested == _default_project_id or projects.exists(requested):
+        return requested
+    raise HTTPException(status_code=400, detail="Unknown project")
+
+
 def require_any_auth(
     request: Request,
     obs_session: Annotated[str | None, Cookie()] = None,
 ) -> str:
     """Read endpoints accept either path and return the project id.
 
-    The UI reads with a cookie; the SDK and scripts read with a key. Both
-    resolve to a project, which is all the read layer needs.
+    The UI reads with a cookie and names its project in a header; the SDK and
+    scripts read with a key, and **the key's project always wins** — a client
+    cannot widen its own scope by asking. A key presented alongside a header
+    naming a different project is refused rather than quietly served from the
+    key's project, because the two disagree about what was being asked for and
+    guessing between them is how a script silently reports on the wrong app.
     """
     if obs_session:
         user = sessions.resolve_session(obs_session)
         if user is not None:
-            return _admin_project_id
+            return _selected_project(request)
 
     authorization = request.headers.get("authorization", "")
     scheme, _, token = authorization.partition(" ")
@@ -206,9 +300,44 @@ def require_any_auth(
 
         authed = _lookup(token.strip())
         if authed is not None:
+            requested = request.headers.get(PROJECT_HEADER, "").strip()
+            if requested and requested != authed.project_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="This key belongs to a different project",
+                )
             return authed.project_id
 
     raise HTTPException(status_code=401, detail="Not authenticated")
+
+
+def require_admin(
+    user: Annotated[SessionUser, Depends(require_session)],
+) -> SessionUser:
+    """An admin session, for the surfaces only an admin should even see.
+
+    The middleware already refuses every write from a viewer, so this is not
+    what stops a viewer editing things — it is what stops them *reading* the
+    handful of pages that are admin-only, where a 403 is the whole point rather
+    than a backstop.
+    """
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admins only")
+    return user
+
+
+def require_session_project(
+    request: Request,
+    user: Annotated[SessionUser, Depends(require_session)],
+) -> str:
+    """The project a signed-in user is working in. Rejects API keys.
+
+    The write half of `require_any_auth`: the routes that create keys, spend on
+    credentials or start runs are session-only, and every one of them used to
+    reach for the module-level default. Taking the project through a dependency
+    is what stops the next route added here from doing the same.
+    """
+    return _selected_project(request)
 
 
 # --------------------------------------------------------------------------
@@ -219,6 +348,25 @@ def require_any_auth(
 class LoginRequest(BaseModel):
     email: EmailStr
     password: str
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    """The one place the session cookie's flags are written.
+
+    Two routes mint a session — signing in and accepting an invite — and these
+    flags are the difference between a cookie JavaScript cannot read and one it
+    can. Two copies would eventually disagree, and the copy that lost a flag
+    would keep working.
+    """
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=token,
+        httponly=True,  # unreadable from JS, so XSS can't exfiltrate it
+        secure=_settings.cookie_secure,
+        samesite=_settings.cookie_samesite,  # type: ignore[arg-type]
+        max_age=int(sessions.SESSION_TTL.total_seconds()),
+        path="/",
+    )
 
 
 @app.post("/api/auth/login")
@@ -242,16 +390,8 @@ def login(body: LoginRequest, request: Request, response: Response) -> dict[str,
     token = sessions.create_session(
         user.user_id, user_agent=request.headers.get("user-agent", "")
     )
-    response.set_cookie(
-        key=SESSION_COOKIE,
-        value=token,
-        httponly=True,  # unreadable from JS, so XSS can't exfiltrate it
-        secure=_settings.cookie_secure,
-        samesite=_settings.cookie_samesite,  # type: ignore[arg-type]
-        max_age=int(sessions.SESSION_TTL.total_seconds()),
-        path="/",
-    )
-    return {"email": user.email}
+    _set_session_cookie(response, token)
+    return {"email": user.email, "role": user.role}
 
 
 @app.post("/api/auth/logout")
@@ -271,7 +411,152 @@ def logout(
 
 @app.get("/api/auth/me")
 def whoami(user: Annotated[SessionUser, Depends(require_session)]) -> dict[str, str]:
-    return {"email": user.email, "user_id": user.user_id}
+    """Who is signed in, and what they may do.
+
+    The role is here so the UI can stop offering what the server would refuse.
+    It is not what enforces anything — a hidden button is not security, and the
+    middleware refuses the write regardless of what the client rendered.
+    """
+    return {"email": user.email, "user_id": user.user_id, "role": user.role}
+
+
+class InviteRequest(BaseModel):
+    email: str
+    name: str = ""
+    role: str = "viewer"
+    note: str = ""
+
+
+class RoleRequest(BaseModel):
+    role: str
+
+
+class AcceptRequest(BaseModel):
+    token: str
+    password: str
+
+
+@app.get("/api/auth/invite")
+def check_invite(token: str) -> dict[str, str]:
+    """Who a pending invite is for. Public, gated on holding the token."""
+    email = sessions.invite_email(token)
+    if email is None:
+        raise HTTPException(
+            status_code=404, detail="That invite link is invalid, used, or expired"
+        )
+    return {"email": email}
+
+
+@app.post("/api/auth/accept")
+def accept_invite(body: AcceptRequest, request: Request, response: Response) -> dict[str, str]:
+    """Redeem an invite and sign in, in one step.
+
+    Signing them in immediately rather than bouncing to the login form: they
+    have just proved they hold the invite and just chose the password, so
+    asking for it back is ceremony that teaches nothing.
+    """
+    try:
+        user = sessions.accept_invite(body.token, body.password)
+    except sessions.AccessError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    token = sessions.create_session(
+        user.user_id, user_agent=request.headers.get("user-agent", "")
+    )
+    _set_session_cookie(response, token)
+    return {"email": user.email, "role": user.role}
+
+
+@app.get("/api/people")
+def list_people(user: Annotated[SessionUser, Depends(require_admin)]) -> dict[str, Any]:
+    """The allowlist, including people who have never signed in."""
+    return {"people": sessions.list_people(), "roles": list(sessions.ROLES)}
+
+
+@app.post("/api/people", status_code=201)
+def invite_person(
+    body: InviteRequest, user: Annotated[SessionUser, Depends(require_admin)]
+) -> dict[str, str]:
+    """Invite someone, returning a one-time token shown exactly once.
+
+    The token is returned rather than emailed. This app has no mail
+    configuration and no fixed hostname, and inventing either to deliver a
+    string would be more machinery than the string is worth — the client builds
+    the link from whatever origin it is being used at, which is the one URL
+    known to work.
+    """
+    try:
+        token = sessions.invite(
+            body.email, body.name, body.role, body.note, user.user_id
+        )
+    except sessions.AccessError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"email": sessions.normalize_email(body.email), "token": token}
+
+
+@app.patch("/api/people/{email}")
+def set_person_role(
+    email: str, body: RoleRequest, user: Annotated[SessionUser, Depends(require_admin)]
+) -> dict[str, str]:
+    _guard_seeded_admin(email, "change the role of")
+    try:
+        sessions.set_role(email, body.role)
+    except sessions.AccessError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"email": sessions.normalize_email(email), "role": body.role}
+
+
+@app.post("/api/people/{email}/reset")
+def reset_person_password(
+    email: str, user: Annotated[SessionUser, Depends(require_admin)]
+) -> dict[str, str]:
+    """Issue a single-use link letting someone set a new password.
+
+    Refused for the `.env` admin, because that account's password is defined by
+    the environment: `seed_admin` re-hashes it from `.env` on the next boot, so
+    a reset would appear to work and then silently revert.
+    """
+    _guard_seeded_admin(email, "reset the password of")
+    try:
+        token = sessions.issue_reset(email)
+    except sessions.AccessError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"email": sessions.normalize_email(email), "token": token}
+
+
+@app.delete("/api/people/{email}")
+def revoke_person(
+    email: str, user: Annotated[SessionUser, Depends(require_admin)]
+) -> dict[str, str]:
+    """Revoke access and end their sessions."""
+    _guard_seeded_admin(email, "revoke")
+    try:
+        sessions.revoke(email)
+    except sessions.AccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"status": "revoked"}
+
+
+def _guard_seeded_admin(email: str, action: str) -> None:
+    """Refuse to demote or revoke the .env admin.
+
+    Not paternalism — the change would not survive. `seed_admin` re-asserts
+    that address as an un-revoked admin on every boot, so allowing it here
+    would let you lock yourself out until the next restart and then silently
+    undo itself. Refusing says what is actually true: this account is defined
+    by .env, so change it there.
+    """
+    if not _settings.admin_email:
+        # No seeded admin to protect: the env vars were removed after
+        # bootstrap, so every account is an ordinary, manageable one.
+        return
+    if sessions.normalize_email(email) == sessions.normalize_email(
+        _settings.admin_email
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot {action} the admin from .env — change ADMIN_EMAIL instead",
+        )
 
 
 # --------------------------------------------------------------------------
@@ -414,13 +699,80 @@ class CreateKeyRequest(BaseModel):
     name: str
 
 
+class ProjectRequest(BaseModel):
+    name: str
+
+
+@app.get("/api/projects")
+def list_projects(
+    request: Request,
+    user: Annotated[SessionUser, Depends(require_session)],
+) -> dict[str, Any]:
+    """Every project, plus which one this request resolved to.
+
+    **Deliberately does not validate the project header**, unlike every other
+    session route. A client holding an id that no longer exists gets a 400 from
+    all of them, and if this route joined in, the one call that could tell it
+    what to switch *to* would fail for the same reason — a stale id would need
+    a manual cache clear to escape. Reporting the resolved project instead lets
+    the client notice the disagreement and adopt the answer.
+
+    Session-only: an ingest key is scoped to one project by construction, and
+    enumerating the others is not something the app sending spans should be
+    able to do.
+    """
+    requested = request.headers.get(PROJECT_HEADER, "").strip()
+    current = requested if requested and projects.exists(requested) else _default_project_id
+    return {
+        "projects": projects.list_projects(),
+        "current": current,
+        "default": _default_project_id,
+    }
+
+
+@app.post("/api/projects", status_code=201)
+def create_project(
+    body: ProjectRequest,
+    user: Annotated[SessionUser, Depends(require_session)],
+) -> dict[str, str]:
+    """Create an empty project.
+
+    Takes no project header: you cannot be working inside the project you are
+    about to create, and requiring a valid current one would make this the
+    hardest route to reach from a bad state.
+    """
+    try:
+        project_id = projects.create_project(body.name)
+    except ProjectError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"id": project_id, "name": body.name.strip()}
+
+
+@app.patch("/api/projects/{target_id}")
+def rename_project(
+    target_id: str,
+    body: ProjectRequest,
+    user: Annotated[SessionUser, Depends(require_session)],
+) -> dict[str, str]:
+    """Rename any project, including the one called "default" at boot."""
+    try:
+        name = projects.rename_project(target_id, body.name)
+    except ProjectError as exc:
+        status_code = 404 if str(exc) == "Project not found" else 400
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    return {"id": target_id, "name": name}
+
+
 @app.get("/api/keys")
-def list_keys(user: Annotated[SessionUser, Depends(require_session)]) -> dict[str, Any]:
+def list_keys(
+    project_id: Annotated[str, Depends(require_session_project)],
+    user: Annotated[SessionUser, Depends(require_admin)],
+) -> dict[str, Any]:
     with get_pool().connection() as conn:
         rows = conn.execute(
             "SELECT id, name, key_prefix, created_at, last_used_at, revoked_at "
             "FROM api_keys WHERE project_id = %s ORDER BY created_at DESC",
-            (_admin_project_id,),
+            (project_id,),
         ).fetchall()
     return {
         "keys": [
@@ -439,21 +791,23 @@ def list_keys(user: Annotated[SessionUser, Depends(require_session)]) -> dict[st
 
 @app.post("/api/keys")
 def create_key(
-    body: CreateKeyRequest, user: Annotated[SessionUser, Depends(require_session)]
+    body: CreateKeyRequest,
+    project_id: Annotated[str, Depends(require_session_project)],
 ) -> dict[str, str]:
     """Returns the plaintext exactly once. Only a hash is stored."""
-    plaintext = create_api_key(_admin_project_id, body.name)
+    plaintext = create_api_key(project_id, body.name)
     return {"key": plaintext, "name": body.name}
 
 
 @app.delete("/api/keys/{key_id}")
 def revoke_key(
-    key_id: str, user: Annotated[SessionUser, Depends(require_session)]
+    key_id: str,
+    project_id: Annotated[str, Depends(require_session_project)],
 ) -> dict[str, str]:
     with get_pool().connection() as conn:
         conn.execute(
             "UPDATE api_keys SET revoked_at = now() WHERE id = %s AND project_id = %s",
-            (key_id, _admin_project_id),
+            (key_id, project_id),
         )
     return {"status": "revoked"}
 
@@ -493,13 +847,22 @@ def list_providers(
 
 @app.get("/api/credentials")
 def list_credentials(
-    user: Annotated[SessionUser, Depends(require_session)],
+    project_id: Annotated[str, Depends(require_session_project)],
+    user: Annotated[SessionUser, Depends(require_admin)],
 ) -> dict[str, Any]:
     """Provider keys, without secrets, with what each has actually cost.
 
     Session-only, unlike the read API: an ingest key identifies an app sending
     spans, and that app has no business enumerating the keys this backend
-    spends on.
+    spends on. **Admin-only within that**, because this is the one read that is
+    purely about spending: key names, their last four, and what each has cost.
+    A viewer cannot spend, so the only thing this could tell them is whose
+    money is behind the dashboard — which is administration, not observation.
+
+    The two controls built on it degrade correctly rather than breaking: the
+    credential picker and the Overview's "which key paid" filter both render
+    nothing when the list is empty, which is the honest answer for someone who
+    has no key to choose between.
 
     Spend is merged in from the span store rather than taken from the
     credential row's own run/score totals, which miss Playground and guardrail
@@ -507,8 +870,8 @@ def list_credentials(
     should stay readable without a lookup into a table row that may since have
     been archived.
     """
-    spend = _query.spend_by_credential(_admin_project_id)
-    rows = credentials.list_credentials(_admin_project_id)
+    spend = _query.spend_by_credential(project_id)
+    rows = credentials.list_credentials(project_id)
     for row in rows:
         row["spend_usd"] = spend.get(row["name"], 0.0)
     return {"credentials": rows}
@@ -517,7 +880,7 @@ def list_credentials(
 @app.post("/api/credentials", status_code=201)
 def create_credential(
     body: CredentialRequest,
-    user: Annotated[SessionUser, Depends(require_session)],
+    project_id: Annotated[str, Depends(require_session_project)],
 ) -> dict[str, str]:
     """Store a provider key. Validated against the provider before saving.
 
@@ -527,7 +890,7 @@ def create_credential(
     """
     try:
         credential_id = credentials.create_credential(
-            _admin_project_id,
+            project_id,
             name=body.name,
             secret=body.secret,
             provider=body.provider,
@@ -541,9 +904,9 @@ def create_credential(
 @app.post("/api/credentials/{credential_id}/default")
 def set_default_credential(
     credential_id: str,
-    user: Annotated[SessionUser, Depends(require_session)],
+    project_id: Annotated[str, Depends(require_session_project)],
 ) -> dict[str, str]:
-    if not credentials.set_default(_admin_project_id, credential_id):
+    if not credentials.set_default(project_id, credential_id):
         raise HTTPException(status_code=404, detail="Key not found")
     return {"status": "default"}
 
@@ -551,10 +914,10 @@ def set_default_credential(
 @app.delete("/api/credentials/{credential_id}")
 def archive_credential(
     credential_id: str,
-    user: Annotated[SessionUser, Depends(require_session)],
+    project_id: Annotated[str, Depends(require_session_project)],
 ) -> dict[str, str]:
     try:
-        if not credentials.archive_credential(_admin_project_id, credential_id):
+        if not credentials.archive_credential(project_id, credential_id):
             raise HTTPException(status_code=404, detail="Key not found")
     except CredentialError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -727,7 +1090,7 @@ def create_run(
     """
     try:
         run = runner.create_run(
-            project_id=_admin_project_id,
+            project_id=project_id,
             dataset_id=body.dataset_id,
             name=body.name,
             prompt_template=body.prompt_template,
@@ -774,7 +1137,7 @@ def cancel_run(
     run_id: str, user: Annotated[SessionUser, Depends(require_session)]
 ) -> dict[str, str]:
     """Stop a run in flight. Checked between items, so in-flight calls finish."""
-    if not runner.cancel_run(_admin_project_id, run_id):
+    if not runner.cancel_run(project_id, run_id):
         raise HTTPException(status_code=400, detail="Run is not cancellable")
     return {"status": "cancelling"}
 
@@ -933,13 +1296,13 @@ def try_scorer(
     """
     try:
         return scoring.try_scorer(
-            _admin_project_id,
+            project_id,
             scorer_id,
             input_text=body.input,
             output_text=body.output,
             expected=body.expected,
             writer=_writer,
-            credential=credentials.resolve(_admin_project_id, body.credential_id),
+            credential=credentials.resolve(project_id, body.credential_id),
         )
     except (ScorerError, CredentialError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -971,7 +1334,7 @@ def run_playground(
     """
     try:
         return playground.run(
-            project_id=_admin_project_id,
+            project_id=project_id,
             prompt=body.prompt,
             model=body.model,
             max_tokens=body.max_tokens,
@@ -1020,11 +1383,11 @@ def score_run(
     """Score a finished run. Returns immediately; the UI polls for results."""
     try:
         calls = scoring.score_run(
-            _admin_project_id,
+            project_id,
             run_id,
             body.scorer_ids,
             _writer,
-            credentials.resolve(_admin_project_id, body.credential_id),
+            credentials.resolve(project_id, body.credential_id),
         )
     except (ScorerError, CredentialError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1045,21 +1408,21 @@ def score_span(
     need not be a score *of* that span, which is exactly the kind of quiet
     disconnect an observability tool cannot afford.
     """
-    spans = _query.get_trace(_admin_project_id, trace_id)
+    spans = _query.get_trace(project_id, trace_id)
     span = next((s for s in spans if s["span_id"] == span_id), None)
     if span is None:
         raise HTTPException(status_code=404, detail="Span not found")
 
     try:
         score_ids = scoring.score_span(
-            _admin_project_id,
+            project_id,
             trace_id=trace_id,
             span_id=span_id,
             input_text=span.get("gen_ai_input_messages") or "",
             output_text=span.get("gen_ai_output_messages") or "",
             scorer_ids=body.scorer_ids,
             writer=_writer,
-            credential=credentials.resolve(_admin_project_id, body.credential_id),
+            credential=credentials.resolve(project_id, body.credential_id),
             # Which key produced the text being judged. Read off the span
             # rather than assumed to be the judge's: scoring a span from last
             # week with today's key must not relabel who generated it. Spans

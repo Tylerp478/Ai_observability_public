@@ -136,7 +136,10 @@ scorers and returns pass/block.
 - Use type hints everywhere; I want to read the code and understand it
 - The UI must be usable on a phone — I'll be demoing from mobile. 
   Trace lists and detail views especially.
-- Skip multi-tenancy and RBAC until I ask for them
+- ~~Skip multi-tenancy and RBAC until I ask for them~~ — **both asked for
+  and built (2026-09-01).** Projects are first-class and every read and
+  write is scoped to one; access is an admin-managed allowlist with two
+  roles, admin and viewer. Do not "simplify" either back out.
 - No Docker/K8s until we have something worth deploying
 - Keep dependencies minimal; explain any library you pull in
 - Beyond the storage interface and the auth middleware, don't add 
@@ -147,8 +150,12 @@ scorers and returns pass/block.
 
 ## What I do NOT want
 - A polished landing page
-- OAuth, magic links, or a third-party auth provider — password login 
-  is enough for one user
+- OAuth or a third-party auth provider. Still true, and now deliberate
+  rather than incidental: an OAuth redirect URI has to be registered
+  against a hostname this app does not have. Login is a password;
+  additional people are invited by an admin and set their own. The
+  invite link is a one-time token, not a magic link — it creates an
+  account, it does not sign anyone in without a password.
 - Feature parity with any existing platform
 - Multi-agent orchestration (that's a different tool)
 - ML model training or fine-tuning capabilities

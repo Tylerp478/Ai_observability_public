@@ -316,16 +316,23 @@ anyone outside your own projects.
    `GET /api/sources`, `?source=` on both reads, a shared picker holding its
    value in the URL, and a Sources section on the Keys page. Verified on real
    data: per-source prompt counts sum exactly to the unfiltered total.
-4. **Google auth + allowlist + roles** (Item 4) — **deferred**, waiting on a
-   stable hostname. Touches schema, routes, nav, and CLAUDE.md.
-5. **Projects as first-class sources** — only if `service_name` turns out to be
-   too coarse once it is in real use.
+4. **Google auth + allowlist + roles** (Item 4) — **the allowlist and roles
+   are built (2026-09-01)**, on local accounts with admin-issued invites, which
+   never needed the hostname. Only the "no passwords for other people" half is
+   still open, and GitHub's device flow would do it without a redirect URI at
+   all. CLAUDE.md updated in the same change, as this item required.
+5. ~~**Projects as first-class sources**~~ — **done 2026-08-31.** A header
+   picker, `X-Obs-Project` on every call, projects CRUD minus delete, and the
+   15 session routes that reached past their dependencies for the module
+   global. The gate ("only if `service_name` is too coarse") now describes when
+   to reach for a project rather than whether to build one.
 6. **Vendor-agnostic providers** (Item 5) — **Phase 1 built 2026-08-28.**
    Provider registry in `llm.py`, Anthropic moved behind it unchanged, an
    OpenAI-compatible adapter registered for xAI, routing switched from the
    model id to the credential, pricing keyed on `(provider, model)`. No schema
-   migration was needed. Phases 2–4 (cost fidelity, Gemini, the full UI) are
-   still open. Copilot is rejected as a provider — see the item for why.
+   migration was needed. **All four phases are now built** — cost fidelity,
+   Gemini, and the UI, with every rate verified against its vendor. Copilot is
+   rejected as a provider — see the item for why.
 
 ## Item 2b — multiple Anthropic keys (built 2026-07-29)
 
@@ -1080,3 +1087,373 @@ discovered surprise.
 With this, every rate in the table is either verified against its vendor or
 explicitly marked as unverifiable legacy. That closes the pricing work opened
 in Phase 2.
+
+## Item 5, Phase 4 — the credential picker names its provider (2026-08-31)
+
+The last open bullet of Phase 4, and the one the rest of the phase created.
+`CredentialPicker` disclosed *which key pays* — the fact worth showing when
+every key was Anthropic. Once a key could be Anthropic, xAI or Google, the
+disclosure was half a fact: "prod" and "prod-eu" say nothing about which vendor
+they reach, and since Phase 4's first bullet the model dropdown silently
+follows the selected key. Picking a key and watching the model list change
+underneath was the only way to learn what a key was for.
+
+Options now read `Grok test account · xAI`.
+
+**In the option text, not an `<optgroup>` header.** Grouping reads better with
+the menu open and is worth nothing with it closed — a native select renders
+only the chosen option's text, and closed is the state you read before pressing
+Run. The provider sits before the `(default)` marker so that when the compact
+select truncates at 230px, what falls off the end is the marker rather than the
+vendor. The full string is on `title` either way.
+
+**One definition of a provider's name.** The Keys page had a local
+`providerLabel` over `/api/providers`; that is now `useProviderLabel` in
+`use-models.ts`, which already owned the registry query, and both surfaces read
+it. Two places rendering the same registry under two names was a drift waiting
+to happen, not a duplication worth keeping.
+
+Verified in the app: Playground shows `Default (from .env) · Anthropic
+(default)` and `Grok test account · xAI`, selecting the xAI key swaps the model
+list to `grok-4.6 / 4.5 / 4.3`, the compact picker on a scorer's Try it
+truncates the marker and keeps the vendor, and the Keys page labels are
+unchanged. Clean typecheck, lint and console.
+
+With this, **Item 5 Phase 4 is complete**, and so is Item 5.
+
+## Projects as first-class sources (built 2026-08-31)
+
+Build order item 5, gated in Item 2 on `service_name` proving too coarse. It
+was built on request rather than because that gate tripped — and the gate is
+still the right description of when to *use* one, which is now in the UI copy:
+a project is for an app that should have its own datasets, scorers, prompts and
+bill, and telling apart apps that share those is still a source filter.
+
+### What was already true
+
+Almost all of it. Every Postgres table has carried `project_id` since step 2a,
+the span store has always been partitioned `traces/project=<id>/dt=…`, and
+`TraceQuery._spans_relation` has always taken a project. **35 of the 50 routes
+already declared `project_id: Depends(require_any_auth)`** and needed no change
+at all. The column was true and inert: `ensure_project("default")` at boot was
+the only value it ever took.
+
+So this was not a data-model change. It was removing one pin.
+
+### The pin, and the 15 routes around it
+
+`require_any_auth` returned `_admin_project_id` for any cookie request, and 15
+session-only routes — keys, provider credentials, run creation, scoring, the
+Playground — reached past their dependencies for the same module global. Those
+now take `require_session_project`, which exists mostly so the next route added
+here cannot quietly reach for a global again. The global survives under a
+truer name, `_default_project_id`: what a request lands in when it names none.
+
+### A header, not a cookie
+
+The browser names its project in `X-Obs-Project`. A cookie would have been less
+code and is the wrong shape: it is ambient, so it would ride along on ingest
+and on `curl` calls that never chose a project, and *silently writing to the
+wrong project* is the failure that cannot be undone.
+
+Two rules make the seam safe, and both are tested:
+
+  - **A key's project always wins.** A bearer key presented with a header
+    naming a different project is a **403**, not a quiet fall back to the key's
+    project. The two disagree about what was asked for, and guessing is how a
+    script reports on the wrong app.
+  - **An unknown project id is a 400**, not a fall back to the default.
+    Answering with a different project's spend is exactly the lie this app
+    exists not to tell. `GET /api/projects` is the single deliberate exception
+    — it reports which project it resolved instead of validating, because a
+    client holding a stale id needs one route that still answers to escape.
+
+### No deleting, and no across-projects view
+
+Both are absences on purpose, argued in `projects.py`. Postgres would cascade
+where the object store cannot, so a delete leaves Parquet under
+`traces/project=<id>/` that nothing can name again; rename covers what actually
+comes up. And an "all projects" mode would work on the two pages backed by the
+span store and silently ignore itself on the six backed by a boundary that
+exists to keep things apart.
+
+### Two bugs found in the client, both mine, both about the same thing
+
+The UI half is small — a header picker, a `Projects` section on the Keys page,
+one header in `request()` — and it went wrong twice, in the two places where
+project state has more than one source.
+
+**`queryClient.clear()` does not refetch.** The first switch wrote the
+selection, emptied the cache and left the page showing the old project's
+numbers, because clearing removes entries without asking any observer to fetch
+again. `resetQueries` is the primitive that does both. `invalidateQueries` is
+wrong here too, in the other direction: it keeps serving the old answer until
+the new one lands, which is the mislabelled number, just briefly. The projects
+list itself is excluded — it is the one query that is not project-scoped, and
+blanking it unmounts the picker mid-switch.
+
+**Two sources of truth for the selection raced each other.** `?project=` in the
+URL began as a peer of `localStorage`, read fresh on every request. Switching
+while a param was present then did something worse than nothing: the picker
+wrote the new project, the refetch fired, and the still-present param sent
+every one of those calls back to the old one. The param is now an *input* to
+storage rather than a rival — adopted synchronously on the first read of a page
+load, never consulted again — so a shared link still opens in its own project
+and a switch cannot be undone by the URL it happened on.
+
+Their common shape is worth keeping: **the second source of truth was always
+the stale one.** The same mistake appeared a third time in the recovery effect,
+which adopted the backend's `current` on any mismatch. Stripping `?project=`
+remounts the picker, the effect re-ran against a cached `current` that was
+still the old project, and the switch reverted. It now fires only when the
+stored id names no project the backend knows — recovery from a reset database,
+which is all it was ever for.
+
+### Verified
+
+End to end against the real install, with a second project created for it:
+
+  - the default project reads 35 prompts and $0.084 over 30 days; the second
+    reads 0 with the same window selected, and its Datasets, Sources, ingest
+    keys and provider keys are all empty;
+  - creating a dataset under the second project makes it visible there and not
+    in the default, and fetching it by id from the default is a 404;
+  - an ingest key reads its own project, is refused with 403 against another,
+    and cannot enumerate projects at all;
+  - an unknown project id is a 400 everywhere except `/api/projects`;
+  - `?project=<id>` opens a link in that project, and switching away from it
+    holds through navigation.
+
+The second project ("Staging env") was removed afterwards with a direct
+`DELETE FROM projects`, which is the only way there is one — checked first
+against all nine `project_id` tables (0 rows) and against the span store (no
+`traces/project=…` partition), so nothing cascaded and nothing was orphaned.
+That check is exactly the work the absent route would have had to do, and the
+reason it is absent: it can only be done honestly by looking at both stores.
+
+A production `next build` passes with all 12 pages prerendered, which is what
+confirms the shell's Suspense boundary — the picker calls `useSearchParams`
+from the chrome every page renders inside, so without it every page would have
+failed to prerender rather than just one.
+
+### Still open
+
+Provider keys are per-project, which means a new project cannot spend until a
+key is pasted into it. That is the honest reading of the schema and of what a
+project is for, and the empty state says so — but it is the one place where the
+boundary costs real setup, and sharing a credential across projects is the
+alternative if that becomes annoying.
+
+## Item 4, without Google — an allowlist and two roles (built 2026-09-01)
+
+Item 4 bundled three things and deferred all of them behind one blocker. Only
+one of the three actually needed a third party: **not storing other people's
+passwords**. The allowlist and the roles never did, and they are the part that
+protects anything, so they were built on the local-accounts path that already
+existed.
+
+Worth recording, because the deferral note is misleading as written: local dev
+was never blocked. Google accepts `http://localhost:3000/...` as a registered
+redirect URI — loopback is exempt from the HTTPS rule. The rotating hostname is
+a problem for a *deployed* instance, not for running this.
+
+### What did not change, exactly as the plan promised
+
+The session layer. Server-side rows in Postgres, hashed cookie value, real
+revocation, 30-day sliding expiry — untouched. Both new ways in mint the same
+`obs_session`. "Google replaces the credential check, not the session" turned
+out to describe an invite just as well.
+
+### The role lives on the allowlist, not on the user
+
+One decision everything else follows from. `allowed_emails` is checked on
+**every request** anyway — that is what makes a revocation take effect on the
+next click rather than up to 30 days later — so reading the role from the same
+row costs nothing and cannot drift from it. A `users.role` column would be a
+second copy of the answer, and the two would disagree in exactly the window
+that matters: between a demotion and that person's next login.
+
+Verified: promoting a signed-in viewer to admin, then demoting them, changed
+what their **existing session** could do on the very next request, with no
+re-login either way.
+
+### Enforcement is one middleware check, not thirty decorators
+
+`default_deny` already establishes that a route added without the right
+dependency fails closed. The role gate extends it rather than competing with
+it: a cookie-authenticated request with a non-GET method and a viewer's role is
+refused before it reaches any route. Thirty-odd write routes each remembering
+`Depends(require_admin)` is thirty chances to forget.
+
+It runs **only on writes** — a viewer reads everything, so gating GETs would
+buy nothing and would put a second session lookup in front of every poll on a
+live dashboard. Bearer requests are untouched: an ingest key has no role and
+POSTing spans is its whole purpose. Exactly one write is exempt, `logout`; a
+read-only user trapped in a session they cannot end would be a worse outcome
+than anything this prevents.
+
+`require_admin` still exists, for the handful of **reads** that are admin-only
+— ingest keys, the allowlist, and provider credentials. That last one is a
+judgement: key names, their last four and what each has cost are purely about
+spending, and a viewer cannot spend. Both controls built on it (the credential
+picker, the Overview "which key paid" filter) already render nothing when the
+list is empty, so they degrade into the honest answer rather than breaking.
+
+### The invite link is built from `window.location.origin`
+
+The piece that makes this work with no fixed hostname, and the reason it suits
+this app better than OAuth would. No hostname is configured anywhere; the URL
+the admin is already looking at is the one URL known to reach the backend, so
+the client builds the link from it. Correct on localhost, on a tunnel, and on a
+deployed box without any of them being written down.
+
+There is no email delivery, deliberately — inventing SMTP config to transport a
+string would be more machinery than the string. The token is shown once and
+stored as a SHA-256 hash, the same as an ingest key and a session cookie.
+
+The accept page confirms **who the invite is for** before asking for anything.
+An opaque link that immediately demands a password is indistinguishable from a
+phishing page; showing the address lets the recipient check it is theirs. That
+reveals one email to whoever already holds that email's single-use token, which
+is not a disclosure — it is what they were sent.
+
+### The lockout escape hatch
+
+Because the allowlist is now consulted on every request, a bad edit to it could
+lock everyone out — including out of the page that fixes it. `seed_admin`
+therefore re-asserts the `.env` admin as an accepted, un-revoked **admin** on
+every boot. That is also why the API refuses to revoke or demote that address:
+the change would not survive a restart, and silently undoing an action is worse
+than declining it. The error says what is actually true — that account is
+defined by `.env`, so change it there.
+
+### Verified end to end
+
+  - invite → accept → signed in, with the token refused on replay and a
+    password under 12 characters refused before an account exists;
+  - `Viewer.Test@Example.COM` invited, `viewer.test@example.com` stored and
+    matched at login — the allowlist join is on a normalized address, so a
+    capitalised invite does not lock out the person it was sent to;
+  - a viewer reads Overview, Traces, Datasets, Scorers, Prompts, Guardrails and
+    Projects (all 200) and is refused ingest keys, the allowlist and provider
+    credentials (403);
+  - every write refused for a viewer — datasets, playground, invites, project
+    rename — while logout still works;
+  - revoking killed a **live** session immediately and blocked re-login;
+  - the `.env` admin cannot be revoked or demoted (400, with the reason);
+  - in the browser: the Keys nav item disappears, typing `/keys` gives "This
+    page is for admins" instead of a shell full of dead buttons, the Playground
+    Run button is disabled with a reason even once a prompt is typed, and a
+    read-only banner explains the shape of it in one sentence.
+
+Production build passes with all 13 routes prerendered.
+
+### Still open
+
+  - **`member`** — spend, but no admin surfaces — is still not built. The two
+    roles here are read-only and everything, which is the honest cut while one
+    person holds the keys. The moment someone needs to run an eval without
+    being able to revoke people, the write gate splits into "spends" and
+    "administers", and that is the middleware's one `is_admin` check becoming
+    two.
+  - **Whether a viewer should see trace payloads** — the actual prompts and
+    completions — is still open, and still defaulting to yes. Item 4 raised it;
+    nothing here answers it, and it is worth deciding before anyone outside
+    your own projects gets an invite.
+  - **No password reset.** A viewer who forgets theirs is re-invited by an
+    admin, which works because re-inviting keeps the account and its note. That
+    is fine for a handful of people and would not be for more.
+
+## The .env admin becomes a bootstrap, not a fixture (2026-09-01)
+
+`ADMIN_EMAIL`/`ADMIN_PASSWORD` were authoritative forever: `seed_admin`
+re-hashed the password from `.env` on every boot, so that account's plaintext
+password necessarily lived in a file on disk — the one account in the system
+whose password was not hash-only.
+
+They are now a **bootstrap**. While set, they behave exactly as before,
+including re-asserting that address as an un-revoked admin, which is the escape
+hatch if the allowlist is ever edited into a state nobody can sign in from.
+Once someone has accepted an admin invite and chosen their own password, they
+can be removed — and the app still boots, because `has_active_admin()` says
+there is another way in. Put them back and restart to recover; that path runs
+every boot and always works.
+
+`_guard_seeded_admin` no-ops when the env vars are absent, so the account stops
+being un-manageable at the same moment it stops being env-defined. The two
+facts were always the same fact.
+
+### Password reset, which the invite flow nearly had already
+
+`issue_reset` mints a single-use token against an existing account, redeemed
+through the same accept page. Deliberately **not** `invite()` with the guard
+removed: an invite creates access, a reset replaces a credential on access that
+already exists, and `invite` refuses accepted accounts precisely so it can
+never be used as an unlogged password reset. Same machinery, different intent,
+separate name.
+
+`accept_invite` stopped requiring `accepted_at IS NULL`, since a reset is
+issued against a very much accepted row. The token is the credential either
+way — single-use, expiring, stored only as a hash.
+
+**Issuing one cannot lock anybody out.** The account keeps working on the old
+password until the link is used, which matters most in the case that motivated
+this: the only admin resetting themselves. The People list shows `RESET SENT`
+rather than `INVITED` for exactly that reason — labelling it "invited" would
+claim they have no access when they still do.
+
+Refused for the `.env` admin while those vars are set, because `seed_admin`
+would re-hash from `.env` at the next boot and silently revert the reset.
+
+## The login rate limiter was keyed on a constant (found 2026-09-01)
+
+Diagnosing a failed phone login turned up something worse than the login: every
+UI login on the box was recorded from `127.0.0.1`. `next.config.ts` proxies
+`/api` to the backend, so the TCP peer is the Next server, not the browser.
+
+The schema note says the limiter is keyed by IP rather than by email so nobody
+can lock out a known account. Keyed on a constant it does the *worse* version
+of that: five fumbled passwords from anyone locks out everyone, and an attacker
+shares one allowance with all legitimate users.
+
+**The fix is not application code.** A `_client_ip` helper reading
+`X-Forwarded-For` was written, and then deleted on discovering that uvicorn
+already does this — `--proxy-headers` is on by default with
+`forwarded_allow_ips=127.0.0.1`, so `request.client.host` had *already* been
+rewritten from the header before any of our code ran. The helper was not just
+redundant, it was reading a value the server had already substituted.
+
+So the correct change is one flag in `backend/Dockerfile`:
+`--forwarded-allow-ips "*"`. Safe in that image specifically because the
+backend service publishes no ports at all — only the frontend can reach it, so
+the only `X-Forwarded-For` it can see is the one the proxy in front wrote.
+Documented in the Dockerfile as not to be copied to a directly reachable
+backend, where it would let any caller forge its own address.
+
+In local dev, uvicorn's loopback default means a process on the box can forge
+the header. That is unchanged, is uvicorn's documented behaviour, and matters
+only where anything local could already reach the backend anyway.
+
+## The phone login failure was not the password (2026-09-01)
+
+Recorded because the wrong diagnosis was convincing and nearly stuck.
+
+Reaching `next dev` on the machine's LAN address instead of `localhost` served
+the page but **never hydrated it** — Next 16 refuses cross-origin dev requests,
+so the client bundle never loaded. The login form was server-rendered HTML with
+no JavaScript behind it: tapping Sign in submitted nothing.
+
+Every downstream signal agreed with "wrong password". The login-attempts table
+had no entry from the phone, which reads as "they mistyped it and gave up"
+rather than "the button was dead" — an empty table cannot distinguish a
+failure from an absence. The fix is `allowedDevOrigins` in `next.config.ts`,
+computed from the machine's own interfaces so it cannot go stale silently.
+
+What made it visible was the *second* report — a page stuck on "Checking your
+invite…" — because that state is only reachable if client code never runs. A
+form that does nothing is ambiguous; a spinner that never resolves is not.
+
+**Two real findings came out of chasing the wrong one**, both worth keeping:
+the login rate limiter was keyed on a constant address (see above), and the
+`.env` admin's plaintext password was the only credential in the system not
+stored solely as a hash.
