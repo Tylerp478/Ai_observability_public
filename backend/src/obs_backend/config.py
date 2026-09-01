@@ -22,9 +22,9 @@ class Settings(BaseSettings):
     )
 
     # --- LLM provider ---------------------------------------------------
-    # CLAUDE.md: refuse to start without this rather than failing at the first
-    # call. Not used in 2a, but the scorers in step 4 will, and a boot-time
-    # failure is far cheaper to diagnose than one mid-eval-run.
+    # Optional now, and read for exactly one purpose: seed_from_env adopts it
+    # as the first stored credential so an install that predates the Keys page
+    # keeps working untouched. Every other key arrives through the UI.
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
 
     # Encrypts provider API keys at rest (credentials.py). A urlsafe-base64
@@ -76,18 +76,17 @@ class Settings(BaseSettings):
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
-    def require_anthropic_key(self) -> None:
-        if not self.anthropic_api_key:
-            raise RuntimeError(
-                "ANTHROPIC_API_KEY is not set. Refusing to start — scorer endpoints "
-                "cost money per invocation and failing at boot is cheaper to diagnose "
-                "than failing mid-run. Set it in the repo-root .env."
-            )
+    # There is deliberately no require_anthropic_key() any more. Keys live in
+    # Postgres and are added through the Keys page, so refusing to boot without
+    # one in .env would be circular: the UI that grants a key could never
+    # start. `credentials.warn_if_no_keys` says so at boot instead, and
+    # `credentials.resolve` still refuses before anything is spent — which is
+    # where that guarantee actually belonged. See credentials.warn_if_no_keys.
 
     def require_secret_key(self) -> None:
         """Refuse to start without the key that decrypts stored provider keys.
 
-        Boot-time rather than first-use, matching require_anthropic_key: a
+        Boot-time rather than first-use, unlike the provider keys it protects: a
         backend that starts happily and then cannot decrypt the key it needs
         fails in the middle of a paid run, which is the expensive place to find
         out. Losing this value makes every stored provider key unrecoverable —

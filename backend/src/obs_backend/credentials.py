@@ -1,4 +1,4 @@
-"""Provider API keys — which Anthropic account a call bills to.
+"""Provider API keys — which vendor account a call bills to.
 
 Before this there was one key, read from .env, and every LLM call in the app
 spent it. This makes the key a choice made at the point of spending: a replay
@@ -8,7 +8,7 @@ credential they want, and what they used is recorded on the row afterwards.
 **The secret is encrypted, not hashed, and that is a real difference.** The two
 credentials this app already stores are one-way on purpose — a password is
 argon2id and an ingest key is SHA-256, because both are only ever compared
-against something the caller presents. An Anthropic key has to go into an
+against something the caller presents. A provider key has to go into an
 Authorization header, so it must come back out. That is a weaker position than
 hashing and there is no way around it; what is available is keeping the key
 material somewhere the database is not, so that a Postgres dump on its own
@@ -119,15 +119,17 @@ def create_credential(
         raise CredentialError("Give the key a name")
     if not secret:
         raise CredentialError("Paste the API key")
-    if provider != "anthropic":
-        raise CredentialError(f"Unknown provider {provider!r}")
+    try:
+        adapter = llm.get_provider(provider)
+    except llm.UnknownProvider as exc:
+        raise CredentialError(str(exc)) from exc
 
     if validate:
         try:
-            llm.validate_key(secret)
+            llm.validate_key(provider, secret)
         except Exception as exc:  # noqa: BLE001 — any failure here means unusable
             raise CredentialError(
-                f"Anthropic rejected this key: {type(exc).__name__}. "
+                f"{adapter.label} rejected this key: {type(exc).__name__}. "
                 "Nothing was saved."
             ) from exc
 
@@ -320,6 +322,88 @@ def resolve(project_id: str, credential_id: str | None = None) -> Credential:
                     "running anything that calls a model."
                 )
 
+        conn.execute(
+            "UPDATE provider_credentials SET last_used_at = now() WHERE id = %s",
+            (row[0],),
+        )
+
+    return Credential(
+        id=str(row[0]),
+        name=row[1],
+        provider=row[2],
+        last4=row[3],
+        is_default=row[4],
+        secret=_decrypt(row[5]),
+    )
+
+
+def count_active(project_id: str) -> int:
+    """How many usable provider keys this project has."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM provider_credentials "
+            "WHERE project_id = %s AND archived_at IS NULL",
+            (project_id,),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def warn_if_no_keys(project_id: str) -> bool:
+    """Say loudly, at boot, that nothing here can call a model yet.
+
+    This replaces `Settings.require_anthropic_key`, which refused to boot
+    without ANTHROPIC_API_KEY in .env, and the downgrade from "refuse" to
+    "warn" is deliberate — the premise it was written under has changed.
+
+    That check was correct while a key could only come from the environment:
+    the only way to fix a missing key was to edit .env and restart, so dying at
+    boot cost nothing and diagnosed itself. Keys now live in Postgres and are
+    added through the Keys page, which makes refusing to boot circular — a
+    fresh install with no .env key could never start the UI it needs in order
+    to be given one.
+
+    What that check was really protecting is intact, and at a better
+    granularity: `resolve` runs on every path that spends, so a missing key is
+    still caught before any money moves, and it names the page to go fix it.
+    Boot-time is now the wrong place for it, not the wrong idea.
+    """
+    if count_active(project_id) > 0:
+        return False
+    print(
+        "[credentials] WARNING: no provider keys are configured. Runs, scorers, "
+        "guardrails and the Playground will refuse to spend until one is added "
+        "on the Keys page. Everything else works."
+    )
+    return True
+
+
+def resolve_for_provider(project_id: str, provider: str) -> Credential:
+    """The key this project should spend on a given vendor.
+
+    Exists because "which key pays" and "which vendor is needed" stopped being
+    the same question the moment a second provider was wired up. A judge that
+    runs a Claude model cannot be paid for with an xAI key however the caller
+    picked it, so the caller's choice is a preference and this is the fallback.
+
+    Prefers the project default when it belongs to that vendor — a default is
+    an explicit designation, so honouring it is not the transport layer
+    guessing — and otherwise takes the oldest active key for the vendor. Raises
+    naming the provider, because "no API key" and "no *Anthropic* key" send you
+    to different places on the Keys page.
+    """
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT id, name, provider, last4, is_default, secret_encrypted "
+            "FROM provider_credentials "
+            "WHERE project_id = %s AND provider = %s AND archived_at IS NULL "
+            "ORDER BY is_default DESC, created_at ASC LIMIT 1",
+            (project_id, provider),
+        ).fetchone()
+        if row is None:
+            raise CredentialError(
+                f"No {provider} API key is configured, and this needs one. "
+                "Add it on the Keys page."
+            )
         conn.execute(
             "UPDATE provider_credentials SET last_used_at = now() WHERE id = %s",
             (row[0],),

@@ -320,6 +320,12 @@ anyone outside your own projects.
    stable hostname. Touches schema, routes, nav, and CLAUDE.md.
 5. **Projects as first-class sources** — only if `service_name` turns out to be
    too coarse once it is in real use.
+6. **Vendor-agnostic providers** (Item 5) — **Phase 1 built 2026-08-28.**
+   Provider registry in `llm.py`, Anthropic moved behind it unchanged, an
+   OpenAI-compatible adapter registered for xAI, routing switched from the
+   model id to the credential, pricing keyed on `(provider, model)`. No schema
+   migration was needed. Phases 2–4 (cost fidelity, Gemini, the full UI) are
+   still open. Copilot is rejected as a provider — see the item for why.
 
 ## Item 2b — multiple Anthropic keys (built 2026-07-29)
 
@@ -406,3 +412,671 @@ and a 200 in the network panel for a response the server never sent that time.
 This is what was behind the intermittent empty Traces and Sources lists. Fixed
 with `cache: "no-store"` in the api.ts fetch wrapper — every read here is live
 observability data, where a stale answer is worse than a slow one.
+
+---
+
+## Item 5 — Vendor-agnostic providers (planned 2026-08-28)
+
+### The problem
+
+One vendor is wired up. The ask is to paste a key from xAI, Google, or anyone
+else and have runs, scorers, guardrails and the Playground work against it,
+with cost and latency reported the same way they are for Anthropic today.
+
+The interesting part is not the API calls. It is that **cost stops being a
+lookup and becomes a model**: different vendors bill different *kinds* of
+token, and a table that only knows input and output will quietly under-report
+on exactly the expensive calls.
+
+### What already exists — the audit
+
+Better than expected, because Item 2's seam held. Verified rather than assumed:
+
+- `llm.` is called from **four** modules only — `runner.py:458`,
+  `scoring.py:691`, `playground.py:110`, and guardrails via scoring.
+- `llm.tool_call` — the part flagged as hard in the README — has **exactly one
+  call site**, `scoring.judge` (`scoring.py:691`).
+- Cost is one pure function, `estimate_cost_usd(model, in, out)`, called at
+  four sites, always keyed on the **response** model.
+- The frontend has one model constant, `RUN_MODELS` (`web/lib/api.ts:763`),
+  consumed by six pages.
+
+**No database migration is needed to start.** `provider_credentials.provider`
+already exists (`db.py:495`) with no CHECK constraint, and spans already carry
+`gen_ai.provider.name` (`models.py:26`) because the OTel convention was
+followed. The data model is already vendor-neutral; only the code filling it
+is not.
+
+The single line that blocks everything today is `credentials.py:122`:
+`if provider != "anthropic": raise`.
+
+### Decision — the credential routes the call, not the model id
+
+`provider_for` currently prefix-matches `claude-` (`llm.py:93`). Extending that
+to `grok-`, `gemini-`, `gpt-` looks obvious and is wrong: prefixes collide,
+vendors rename, and a model released next week would be rejected by a lookup
+table that has not been edited yet.
+
+Every path that spends money already calls `credentials.resolve`, and that row
+already names a provider. So:
+
+- **Routing** is `credential.provider` → adapter. Total, never guesses, and a
+  brand-new model id works the day it ships.
+- **Pricing** is keyed on `(provider, response_model)`. Unknown model still
+  returns `None`, which already means "we don't have a price for this" rather
+  than "free" — that behaviour is correct and stays.
+- **The pre-flight guard survives in a better form.** Today `provider_for`
+  raises before spending, which is what stops a typo costing one round trip per
+  test case in a replay run. Replace it with a mismatch check: if the model id
+  is known to the registry and belongs to a *different* provider than the
+  chosen key, refuse. That catches the actual likely error — running
+  `claude-opus-5` against an xAI key — while letting unknown ids through.
+
+`provider_label` keeps its total, never-raising contract for span builders, for
+the reason given in its docstring.
+
+### Phase 1 — Grok, via an OpenAI-compatible adapter — **BUILT 2026-08-28**
+
+xAI speaks the OpenAI wire format, so one adapter buys Grok plus DeepSeek,
+Groq, Together, Fireworks and a local vLLM. That is the highest-leverage first
+move and it is why Grok goes first rather than Gemini.
+
+- Add a `Provider` protocol in `llm.py` with the three methods that already
+  exist as module functions: `complete`, `tool_call`, `validate_key`. A
+  registry dict maps provider name → instance. This is the second real use
+  case, so the abstraction is now earned rather than speculative.
+- `AnthropicProvider` is the current code moved, not rewritten.
+- `OpenAICompatProvider` takes a base URL, so xAI is a two-line registration.
+- `tool_call` maps to `tools=[{type:"function", ...}]` with
+  `tool_choice={"type":"function","function":{"name":…}}`. The judge's schema
+  (`scoring.build_tool_schema`, `scoring.py:580`) is already plain JSON Schema,
+  which is the same thing OpenAI-compatible endpoints want — so the judge port
+  is closer to mechanical than the README feared.
+- `validate_key` uses each provider's models-list endpoint: cheap, unbilled,
+  still exercises auth. Same reasoning as `llm.validate_key` today.
+- Drop the `provider != "anthropic"` gate; validate the name against the
+  registry instead.
+- `_anthropic`'s `lru_cache(maxsize=16)` becomes a per-provider client cache
+  with the same properties — keyed on the secret so a rotated key cannot serve
+  a stale client, bounded so a long-lived process cannot accumulate clients.
+
+**Boot check.** `require_anthropic_key` (`config.py:79`) must relax to "at
+least one usable key exists", counting stored credentials rather than one env
+var. Keep the refuse-to-start behaviour — the reasoning in that docstring is
+still right, only the definition of "a key" widens. `seed_from_env` keeps
+adopting `ANTHROPIC_API_KEY` when present, so existing installs are untouched.
+
+**Done when** a Grok key saves on the Keys page, and a Playground run against
+it produces a span with `gen_ai.provider.name = "xai"`, a latency, and a cost.
+
+### Phase 2 — cost fidelity
+
+Deliberately before Gemini. The point of this tool is trustworthy numbers, and
+Gemini's context-tiered pricing is the hardest pricing case there is — the
+pricing model wants to be general *before* the provider that stresses it most
+arrives, not retrofitted after.
+
+`_Call` (`llm.py:50`) carries only `input_tokens` and `output_tokens`. Three
+things break cost at that resolution:
+
+- **Cached input** is billed differently by every vendor, often ~10× cheaper on
+  read and *more* expensive on write. Ignoring it does not round off; it skews.
+- **Reasoning tokens** bill as output but are reported separately. Missing them
+  under-reports precisely the expensive calls.
+- **Context-length tiers** — above a threshold the per-token rate steps up.
+  The current table has no notion of a rate that depends on request size.
+
+Work: widen `_Call` with `cached_input_tokens` / `cache_write_tokens` /
+`reasoning_tokens`; make the pricing entry a small structure with optional
+cache and tier rates instead of a `(float, float)` tuple; give
+`estimate_cost_usd` the provider and the total token count.
+
+**This needs no Parquet migration to make the numbers right.** `obs.cost_usd`
+is already a promoted column computed at write time, so correct cost lands in
+the existing schema. The extra token counts go into `attributes_json` — which
+is exactly the case the design note in `models.py` anticipated. Promote them to
+real columns only if aggregating on cache-hit rate becomes something worth
+doing, and treat that as its own decision.
+
+Pin any new `gen_ai.usage.*` attribute names against the semconv version in
+use; these are still pre-stable and the names move between releases.
+
+The Sonnet-5 intro-pricing handling (`pricing.py:41`) is the precedent for
+time-boxed rates and should generalize into the same structure rather than
+staying a special case keyed on one model id.
+
+### Phase 3 — Gemini
+
+Native SDK, its own function-calling shape, context-tiered pricing that Phase 2
+has already made expressible. Self-contained once the registry exists: one new
+adapter class, one registration, pricing rows.
+
+### Phase 4 — the UI
+
+- `RUN_MODELS` (`api.ts:763`) stops being a frontend constant and becomes a
+  backend read, filtered to providers a key is actually held for. Offering a
+  model you cannot pay for is a dead end the UI should not render. Six pages
+  consume it and none of their call sites change.
+- Keys page gains a provider dropdown (`web/app/keys/page.tsx:173`), and its
+  copy stops saying "Anthropic" (`:216`, `:324`).
+- `model-mix.tsx:35` hardcodes `claude-haiku|sonnet|opus|fable` as tiers.
+  Tiering across vendors is a genuine design question, not a rename — group by
+  provider first, then by tier within it.
+- The credential picker already discloses which key will pay; it should show
+  the provider too, since that is now part of the fact being disclosed.
+
+### Rejected — Copilot as a provider
+
+It does not fit and should not be forced. There is no general-purpose GitHub
+Copilot completions endpoint that accepts a pasted key and bills per call — the
+API surface is for editor and extension integrations, and the enterprise
+metrics API returns seat counts and acceptance rates, not per-call token usage.
+
+Copilot is a *seat licence with usage statistics*, not a metered inference API.
+Representing it would mean a separate ingestion path answering a different
+question ("what is our per-seat utilisation") against a different data shape,
+sharing none of the work above. Worth doing only as its own item, and only
+after deciding it is a question this tool is trying to answer.
+
+### Rejected — a provider column on every span table
+
+Tempting, and unnecessary. `gen_ai.provider.name` is already promoted
+(`models.py:26`), and per-provider spend rolls up through the credential, which
+already carries the provider. Adding a second source of the same truth invites
+the two to disagree.
+
+### Rejected — abstracting the SDK's tracing wrapper in the same pass
+
+`sdk/src/obs_sdk/tracing.py` wraps an Anthropic client directly (`:203`) and
+hardcodes the provider attribute (`:223`). That is the *observed* application's
+instrumentation, not the backend's spending path — a different user, a
+different release cadence, and no shared code with any of the above. It should
+become vendor-agnostic eventually; doing it inside this item would double the
+surface for no gain in what the backend can bill.
+
+### Estimate
+
+| Phase | |
+|---|---|
+| 1 — registry + OpenAI-compatible adapter (**Grok**) | 1–1.5 days |
+| 2 — cost fidelity (cached / reasoning / tiered) | 1–2 days |
+| 3 — Gemini adapter | 0.5–1 day |
+| 4 — UI | 0.5–1 day |
+
+Roughly **3–5 focused days** for Grok and Gemini done properly. Phase 1 alone,
+accepting naive input/output cost as a first cut, is under a day — the adapters
+really are easy, because the seam is real. Phase 2 is the part that separates
+"it runs" from "the numbers can be trusted", and is the one to resist skipping
+in a tool whose entire purpose is watching spend.
+
+
+## Item 5, Phase 1 — what was built (2026-08-28)
+
+`llm.py` is now a `Provider` protocol (`complete`, `tool_call`, `validate_key`)
+plus a registry. `AnthropicProvider` is the old module-level code moved intact;
+`OpenAICompatProvider` takes a base URL and is registered once, for xAI.
+
+**Routing is the credential**, as planned. `provider_for`'s `claude-` prefix
+match is gone. What replaced the guard it provided is `check_model_matches`,
+which fires only when the pricing table already places a model with a different
+vendor — so `claude-opus-5` on an xAI key is refused before any spend, while a
+model id nobody has seen passes through.
+
+Three things the build turned up that the plan had not:
+
+**1. The boot check had to become a warning.** `Settings.require_anthropic_key`
+refused to start without `ANTHROPIC_API_KEY` in .env. That was right when keys
+could only come from the environment, and is circular now that they live in
+Postgres and are added through the Keys page — a fresh install could never
+start the UI it needs in order to be given a key. It is now
+`credentials.warn_if_no_keys`, printed after seeding. The guarantee it was
+protecting is intact and better placed: `resolve` still refuses on every path
+that spends, before any money moves. This is a deliberate departure from
+CLAUDE.md's "refuse to start if the LLM API key env var is missing".
+
+**2. Guardrails resolve their credential *inside* the try.** So the except path
+could reach `judge_span` with `credential` unbound — a resolve failure is one
+of the failures that block exists to record. A `provider = ""` local seeded
+before the try fixes it, and `provider_label("")` returning `""` is exactly the
+case that function's never-raises contract was written for.
+
+**3. `check_model_matches` in the runner needed wrapping in `RunError`.** The
+POST endpoint catches `RunError`; a bare `ValueError` out of `llm` would have
+surfaced as a 500 for what is plainly a bad request.
+
+**Tool arguments differ in kind, not just in spelling.** Anthropic returns the
+tool input as a dict; an OpenAI-compatible endpoint returns a JSON *string*
+that can arrive truncated. Both now collapse onto the existing
+`payload is None` contract, so `scoring.judge` reads a cut-off judge the same
+way whichever vendor produced it — including the existing max_tokens hint.
+
+Verified with mocked transports: the Anthropic wire format is unchanged
+(forced `tool_choice`, `input_schema`, timeout omitted unless set), the xAI
+adapter normalizes usage/finish_reason/tool arguments and degrades to 0 tokens
+when an endpoint omits `usage`, the guard refuses before any client is
+constructed, and a simulated Grok Playground run produces a span with
+`gen_ai.provider.name = "xai"` priced at $18.00 for 1M+1M tokens.
+
+**Not yet done for Phase 1:** a real xAI key against the live API. Everything
+else is verified against the running stack — `/api/providers` serves both
+providers, the Keys page ships the dropdown, and existing Anthropic data and
+traces are untouched.
+
+Two environment facts found while verifying, worth keeping:
+
+  - `POSTGRES_PASSWORD` was absent from .env and compose refuses to start
+    without it. Added 2026-08-28, hex per the .env.example note.
+  - **The host dev servers shadow the compose stack.** A host uvicorn on :8000
+    and a host Next on :3000 were already running; compose's backend publishes
+    no host port at all, and its web binds `127.0.0.1:3000` while the host Next
+    holds the wildcard. So `localhost:3000` resolves to the *host* stack and
+    `127.0.0.1:3000` to the *container* — two installs, two databases, one
+    plausible-looking URL each. Run one or the other, not both.
+
+**xAI prices in `pricing.py` are the least-confident values in the table** and
+are marked VERIFY. Check them against x.ai's published rates before trusting a
+spend figure.
+
+## Item 5, Phase 1b — cross-vendor grading (2026-08-28)
+
+Found by running it: adding an xAI key and scoring a Grok completion failed,
+because the scorers were being billed to the key that generated the output and
+their models are Claude models. The new mismatch guard was reporting it
+correctly — the bug was upstream of the guard.
+
+**Generating and grading are separate purchases.** They were always the same
+key before a second provider existed, so the Playground handed one credential
+to both and `_execute_job` applied one credential to every scorer.
+`playground.py` even said so in a comment: *"Same key both ways here"*. That
+assumption dies the moment the interesting case arrives — and the interesting
+case is most of the point of not being tied to one vendor, since a judge from
+the same family as the model it grades is the weakest judge available.
+
+**The scorer's own model decides which key pays for it.** `judge_credentials`
+maps each scorer to a credential: the caller's chosen key when it can serve
+that scorer (same vendor, or a model this build cannot attribute), otherwise
+that vendor's default key. Resolved once up front, so a 40-call job decrypts
+each secret once and a missing key fails before anything is paid for rather
+than partway through.
+
+The data model needed no change — `scores` already carried `credential_id` and
+`generation_credential` as separate columns, from the multiple-Anthropic-keys
+work in Item 2b. Only the code that filled them assumed they were equal.
+
+Applied to every judge path, not just the Playground: `score_run`,
+`score_span`, `try_scorer` and guardrails all resolve the same way, so a Claude
+safety scorer keeps working on a guardrail pinned to an xAI key.
+
+**Disclosure over silence.** The Playground response carries `judged_by`, and
+the result footer names the judging key only when it differs from the
+generating one — the same instinct as the credential picker rendering while
+disabled with a single key: it is not offering a choice, it is disclosing a
+fact an app about watching spend should not make you infer. The picker is
+relabelled "Generate with" on the two surfaces that generate, because "API key"
+overstated what it decides.
+
+**Not done, and the honest limit:** a scorer cannot yet be pinned to a
+*specific* key within its vendor — it gets that vendor's default. Guardrails
+already model the better version by carrying their own `credential_id`, and a
+scorer-owned key is the natural refinement if two keys for one vendor ever need
+to be told apart for scoring. Left until that is a real need rather than a
+hypothetical one.
+
+Also fixed here: both new error messages phrased without an indefinite article
+before a vendor name. "a Anthropic key" / "an Google key" is the bug that
+writes itself the next time a provider is registered.
+
+## Item 5, Phase 4 (partial) — model lists follow the key (2026-08-28)
+
+Selecting the xAI key still offered Claude models. The backend refused the
+pairing before spending, so nothing was ever mischarged — but a dropdown that
+lets you pick a guaranteed error is a poor way to learn the rule.
+
+**Providers now declare their own models** (`llm.py`), served through
+`/api/providers`. Curated rather than derived from the pricing table: that
+table also carries legacy and dated ids which exist to cost old traces, and
+offering those would invite new spend on a deprecated model.
+
+**The invariant is enforced instead of asked for.** The old frontend list
+carried a comment asking whoever edited it to keep it in step with the pricing
+table, because a model missing from that table runs fine and silently reports
+no cost. `_check_offered_models_are_priced` runs at import and refuses to start
+if an offered model has no price. In a tool whose job is watching spend, a
+model you can select but cannot cost is the worst kind of bug — it looks like
+it worked.
+
+**Two questions, one hook.** `useModels` distinguishes surfaces that *spend*
+from surfaces that *define*:
+
+  - Playground and the replay run form pass the selected credential, and get
+    only that vendor's models.
+  - A scorer's judge model and a prompt's config pass nothing, and get every
+    model from every provider a key is held for — because a scorer's model is
+    what *chooses* which vendor grades with it (Phase 1b), so narrowing it to
+    one key would hide exactly the cross-vendor judges worth having.
+
+Neither ever offers a model from a provider with no key.
+
+Two details worth keeping:
+
+  - **Derived, not synced.** `effectiveModel` is computed from the offered list
+    each render rather than pushed into state by an effect, so changing the key
+    cannot leave a stale selection the backend would reject.
+  - **[] while loading, not a guess.** Falling back to a Claude model during the
+    fetch would show the wrong model to someone holding only an xAI key and
+    then swap it under them. Callers render an empty select for that instant
+    and guard submit on having a model.
+
+In the dataset run form the key gets the last word over a saved prompt version:
+a version written against a Claude model falls back to something the chosen key
+can serve, visibly, rather than failing on submit.
+
+`RUN_MODELS` is gone. `FALLBACK_MODELS` replaces it and is explicitly not a
+place to add models — anything there that the backend does not offer would be
+selectable and then rejected.
+
+**Still open in Phase 4:** `model-mix.tsx` still tiers on `claude-*` prefixes,
+so Grok spans fall outside its grouping. Tiering across vendors is a design
+question, not a rename.
+
+## Item 5, Phase 2 — cost fidelity (built 2026-08-28)
+
+**The vendors disagree about what a token count means, and both readings look
+plausible.** Anthropic's `usage.input_tokens` counts only tokens that were
+neither read from nor written to the cache; an OpenAI-compatible
+`usage.prompt_tokens` already includes cached tokens. Passing either through as
+"the prompt size" is wrong for the other one, and the failure is silent — you
+get a believable number and only the invoice disagrees.
+
+`_Call` now defines the inclusive reading: `input_tokens` and `output_tokens`
+are totals, with `cached_input_tokens`, `cache_write_tokens` and
+`reasoning_tokens` as named *subsets*. Each adapter normalizes into it —
+Anthropic's by reassembling the total, the OpenAI-compatible one by passing it
+through and extracting the parts. Anthropic calls its reasoning counter
+`thinking_tokens`; that is normalized too, so no caller learns which vendor
+answered.
+
+**What this actually fixes, in order of how much it mattered:**
+
+1. **xAI cached input was billed at the full rate.** xAI caches automatically,
+   with nobody opting in, so this was live from the moment a Grok key was
+   added. A call with an 80% cache hit was reading **67% high**.
+2. **Anthropic's total prompt size was under-reported** whenever caching was
+   used — the cached part was simply missing from the span. Not live today
+   (nothing here sets `cache_control`) but wrong the moment anything does, and
+   wrong by more the better caching works.
+3. **Reasoning tokens were invisible.** This was never a *cost* bug: they are
+   already inside the output count and billed at the output rate, so the totals
+   were right. It was a reporting gap — "what did thinking cost me" had no
+   answer. Recorded now, still priced as output, deliberately not passed to
+   `estimate_cost_usd` because that would double-count.
+
+A price is now a `ModelPrice` — base `Rates`, optional cache read/write rates,
+an optional long-context tier keyed on input size, and a promotional window.
+The Sonnet 5 intro pricing was a hardcoded special case keyed on one model id;
+it is now just a `promo` with a `promo_ends`, and produces the same numbers
+either side of the boundary. Anthropic's cache multipliers (0.1x read, 1.25x
+5-minute write) hold across the model line, so a helper encodes them once and
+each row stays the two numbers that actually differ.
+
+Precedence where a model has both a long-context tier and an active promo: the
+tier wins. Introductory rates are advertised against standard context, so
+applying them to a long-context call would understate the bill. No model
+currently has both; the rule is written down so the first one that does is not
+a surprise.
+
+**No Parquet migration, as predicted.** `obs.cost_usd` is a promoted column
+computed at write time, so correct cost lands in the existing schema. The new
+counts go into `attributes_json` under `obs.*` — deliberately not `gen_ai.*`,
+because the GenAI conventions are pre-stable here and have not settled on names
+for cached or reasoning tokens. Squatting on a `gen_ai.usage.*` name that later
+means something else is worse than a namespaced one that has to be renamed.
+Zeros are omitted rather than written, since most calls cache nothing.
+
+**Not modelled, deliberately:** Anthropic's 1-hour cache-write TTL is 2x base
+against the 5-minute 1.25x, and `usage.cache_creation` reports the split — but
+nothing in this app sets `cache_control` at all, so pricing the distinction
+would be building for a caller that does not exist.
+
+**Still the weakest numbers here:** the xAI rates, and among them the
+cached-input multiplier (0.25x base) most of all. It is now load-bearing in a
+way it was not before — it applies automatically, to every Grok call with a
+cache hit.
+
+## Item 5, Phase 3 — Gemini (built 2026-08-30)
+
+Its own adapter rather than an OpenAI-compatible base URL. Google publishes a
+compatibility endpoint, but going native buys the thing that matters:
+`FunctionDeclaration.parameters_json_schema` takes the judge's plain JSON
+Schema verbatim, so the scorer schema needs no translation into Gemini's own
+`Schema` type and cannot drift from what the other two providers are sent.
+
+**A third token convention, and the one that bites hardest.** The SDK documents
+`total_token_count` as the sum of `prompt_token_count`,
+`candidates_token_count`, `tool_use_prompt_token_count` and
+`thoughts_token_count` — so those four are *disjoint*, which settles the
+question the other two vendors answer differently:
+
+  - `candidates_token_count` does **not** include thinking tokens, unlike
+    Anthropic's and OpenAI's output counts, which do. Gemini 2.5 thinks by
+    default and thinking bills as output, so reading it as the output total
+    under-reports by however much the model thought. In the test case that is
+    8,000 of 10,000 output tokens — an 80% under-report.
+  - `prompt_token_count` does **not** include tool-use prompt tokens, which are
+    billed as input, so they are added back.
+  - `prompt_token_count` *does* include cached content, stated explicitly in
+    the field docs, so cached stays a subset rather than being added twice.
+
+Three vendors, three conventions, and every one of them produces a plausible
+number under the wrong reading. That is the argument for `_Call` defining one
+inclusive meaning and each adapter converting into it, rather than each caller
+learning who answered.
+
+**Two traps worth naming:**
+
+  - **Gemini's timeout is an int of milliseconds**, where ours is float
+    seconds. Passing it through would ask for a 30ms deadline and fail every
+    call — with a timeout error, which reads like a slow model rather than a
+    units bug.
+  - **`validate_key` has to consume the listing.** `models.list()` is lazy; a
+    bare call would validate nothing and report success on a bad key.
+
+**A Phase 1 bug found while doing this.** `scoring.judge`'s "raise max_tokens"
+hint tested `stop_reason == "max_tokens"`, which is Anthropic's spelling. An
+OpenAI-compatible endpoint says `length` and Gemini says `MAX_TOKENS`, so the
+hint never fired for a Grok judge — precisely the case where the advice was
+needed. There is now a `_Call.truncated` property covering all three
+spellings; `stop_reason` keeps the vendor's own word, because that is what the
+span should record.
+
+**The long-context tier built in Phase 2 has its first real user.** Gemini 2.5
+Pro roughly doubles every rate above 200k input tokens. A judge fed a long
+transcript crosses that line without anyone deciding to, which is exactly the
+case a flat rate would silently under-report. Verified firing at the boundary:
+200,000 tokens prices at base, 200,001 at the long tier.
+
+`key_hint` moved onto the registry too, so the Keys page paste-field
+placeholder comes from the same place as everything else about a provider —
+the two-way ternary it replaced was already wrong for a third vendor.
+
+**Not modelled:** Gemini's explicit context caching bills storage per hour
+rather than a per-token write rate, which this table cannot express and this
+app cannot trigger — nothing here creates a cached-content handle. Cache
+*reads* are priced normally.
+
+**Rates entered 2026-08-30 and unverified**, including the 200k threshold.
+Check against https://ai.google.dev/gemini-api/docs/pricing.
+
+## Item 5, Phase 4 — model mix tiering (built 2026-08-30)
+
+The last open piece. `model-mix.tsx` ranked models with a hardcoded ladder of
+`claude-*` prefixes, so six of the nine selectable models rendered
+off-ladder grey the moment a second and third provider existed.
+
+**The fix was to notice what the ramp was already encoding.** The component's
+own docstring argued for a single-hue ordinal ramp on the grounds that
+haiku → sonnet → opus → fable is "a real capability and price ladder". Price is
+the ordering; the prefix list was a hand-maintained proxy for it. So the tier
+now comes from the pricing table — banded on the output rate, which is the
+number that actually separates these models, since input rates cluster far more
+tightly and output is where a real workload's bill is decided.
+
+Consequences worth having stated:
+
+  - **A new vendor needs no edit to this component.** Price a model and it is
+    ranked; the frontend keeps no ladder of its own. This is the same lesson as
+    `RUN_MODELS`: a list in the UI that must be "kept in step" with the backend
+    will drift, so it should not exist.
+  - **The ramp no longer distinguishes vendor.** A Grok and a Claude model in
+    the same price band get the same colour, which is the honest reading of a
+    price scale. Vendor moved to the legend, where the model names say it
+    plainly — and the legend was already load-bearing, since slices are never
+    colour-alone. `shortName` therefore stopped stripping the `claude-` prefix:
+    that was pure noise when every model carried it, and hides the one
+    attribute the colour no longer encodes now that it does not.
+  - **Bands are fixed, not derived from the models present.** Colour follows
+    the model and must not move because a different model was added next to it,
+    which is the same rule the old lookup followed. Verified.
+  - **Anthropic models shifted one rung** (haiku 0→1, sonnet 1→2, opus 2→3),
+    because the cheap tier is now occupied by Grok and Gemini models that
+    genuinely are cheaper than any Claude model. A one-time recalibration, not
+    a drift.
+
+### A costing bug found on the way
+
+The tier lookup and the cost lookup key on the same thing, which is what
+surfaced it: **Gemini reports a build suffix** (`gemini-2.5-pro-002`) as its
+answering model, and no pricing table will carry that. Every Gemini call would
+have reported *no cost at all* — a plausible-looking blank on a dashboard whose
+entire job is spend.
+
+`estimate_cost_usd` now takes `request_model` and falls back to it when the
+answering model is unpriced. Pricing still follows the answer first, because an
+alias resolving to a dated id means the dated id is what was billed; the
+requested model is a safe floor because it is always one this app offered, and
+every offered model is priced by the boot-time invariant.
+
+The mix chart itself was never exposed to this — the overview groups by
+`gen_ai_request_model` (`query.py:522`), not the response model.
+
+## Item 5 — pricing verified against the vendors (2026-08-30)
+
+The rates had been entered from memory and marked VERIFY. Checking them found
+more than wrong numbers.
+
+### xAI: the models were retired, and the app never noticed
+
+`grok-4-fast-reasoning`, `grok-3` and `grok-code-fast-1` were **retired on
+2026-05-15**. Two of the three models this app offered no longer existed.
+
+**xAI does not reject a retired id — it answers with the replacement.** A span
+already in this project proves it: `gen_ai_request_model` says `grok-3-mini`
+and `gen_ai_response_model` says `grok-4.3`. Because `grok-4.3` was not in the
+pricing table, `obs_cost_usd` was **None** on all three Grok calls ever made
+here. Not an error, not a zero anyone would question — a blank, on the one
+dashboard whose job is spend.
+
+Three separate failures had to line up, and each is worth keeping:
+
+  - offering models nobody checked were still alive;
+  - a vendor that silently substitutes rather than failing, so nothing surfaced;
+  - pricing keyed on the *answering* model, which is right, but with no
+    fallback when the answer is unpriced. The `request_model` fallback added
+    with the tiering work would have caught this — at guessed rates, so it is a
+    safety net rather than a substitute for checking.
+
+Offered models are now `grok-4.6`, `grok-4.5`, `grok-4.3`. The retired ids stay
+**priced at what they actually bill** — the replacement's rate, not their
+historical one — because that is what the invoice says, and because the
+dashboard groups by the *requested* model, so dropping them would grey out real
+history and blind `provider_of_model`.
+
+Every xAI text model is also tiered at 200k input, which was not modelled at
+all. All the long-band rates are exactly 2x, so a helper encodes the doubling
+once.
+
+### Gemini: base rates right, cache rates 2.5x too high
+
+The base rates and the 200k threshold on 2.5 Pro were correct as entered. The
+cache rates were not: they had been derived from an assumed 0.25x multiplier
+when Google's actual discount is 0.10x. Pro $0.3125 → $0.125, Flash $0.075 →
+$0.03, Flash-Lite $0.025 → $0.01. An over-estimate rather than an under-one,
+but wrong in the direction that makes caching look less worthwhile than it is.
+
+Google publishes Batch, Flex and Priority tiers at 0.5x and 1.8x of Standard.
+This app uses Standard; the others are noted in the table rather than modelled.
+
+### The vendors disagree about the tier boundary by one token
+
+Google charges the high band *above* 200k. xAI charges it *at or above* 200k.
+`long_context_threshold` is therefore documented as "the largest input that
+still gets base rates" — 200_000 for Gemini, 199_999 for xAI — which expresses
+both with one comparison instead of a second flag. Verified at the boundary in
+both directions.
+
+### Anthropic
+
+Not re-checked. Still as of 2026-07-27, and now the only unverified provider in
+the table.
+
+## Item 5 — Gemini 3.x added (2026-08-31)
+
+Offered models are now `gemini-3.7-flash`, `gemini-3.6-flash`,
+`gemini-3.5-flash-lite` and `gemini-2.5-pro`. The 2.5 Flash models stay priced
+but stop being offered — `gemini-3.5-flash-lite` is priced identically to
+`gemini-2.5-flash` and is newer, so keeping both would be two names for the
+same trade.
+
+**2.5 Pro stays as the Pro option on purpose.** The only Pro-class model in the
+3.x line is `gemini-3.1-pro-preview`, and it is still preview. Offering a
+preview id in a tool that reports spend is how you end up billing a model that
+changed under you — which is precisely what the xAI retirement did. It is
+priced, so a span carrying it still costs and `provider_of_model` can claim it
+for the mismatch guard; it is just not in the dropdown.
+
+**The two newest Flash models are on introductory pricing that doubles on
+2027-01-01**, so `base` holds the post-promo list price and `promo` holds what
+is actually charged until then — the same shape as the Sonnet 5 intro rate.
+Entering today's price as `base` would look right today and quietly halve every
+estimate in January. Verified across the boundary: $4.50 per 1M+1M through
+31 December, $9.00 from 1 January, with the cached rate following the promo too.
+
+**`price_tier` reads `base`, never the promotional rate.** A promo lapses on a
+date; a model whose colour changed overnight on the dashboard — without its
+capability or its place in the lineup changing — would be reporting a calendar
+event as a category change.
+
+## Item 5 — Anthropic pricing verified (2026-08-31)
+
+The last unverified provider, checked against the `claude-api` skill's model
+table rather than from memory. **All nine current models matched as entered**,
+and so did the two cache multipliers the `_anthropic` helper encodes: reads at
+0.1x base input, 5-minute writes at 1.25x.
+
+Also confirmed as a deliberate absence rather than an oversight: Anthropic's 1M
+context window carries **no long-context premium**, which is why no Anthropic
+entry has a `long` tier where every xAI model and Gemini 2.5 Pro do.
+
+Four legacy rows remain unverifiable — `claude-opus-4-5`,
+`claude-opus-4-1-20250805`, `claude-sonnet-4-5-20250929`,
+`claude-3-haiku-20240307`. They are retired or superseded, so no current source
+lists them and there is nothing left to check against. They stay because this
+table doubles as the historical cost table, and dropping a row would silently
+un-cost any old span carrying it. Checked against the span store: no model in
+this project uses one, so the exposure today is zero.
+
+**Two rates this table structurally cannot express**, both now documented in
+the module docstring rather than silently missing:
+
+  - **Fast mode.** `speed: "fast"` on Claude Opus 5 bills $10/$50 rather than
+    $5/$25 — a *different rate for the same model id*.
+  - **Batch API.** 50% of standard, same shape of problem.
+
+Pricing either would need a third key dimension beyond `(provider, model)`.
+Nothing in this app sets `speed` or uses Batches, so no call can currently
+produce one; the note exists so the gap is a known limit rather than a
+discovered surprise.
+
+With this, every rate in the table is either verified against its vendor or
+explicitly marked as unverifiable legacy. That closes the pricing work opened
+in Phase 2.

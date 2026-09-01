@@ -5,13 +5,13 @@ import Link from "next/link";
 import { useState } from "react";
 import { Shell } from "../shell";
 import { CredentialPicker } from "@/components/credential-picker";
+import { useModels } from "@/lib/use-models";
 import {
   api,
   ApiError,
   formatCost,
   formatDuration,
   scoreTone,
-  RUN_MODELS,
   type PlaygroundResult,
   type Score,
 } from "@/lib/api";
@@ -45,11 +45,18 @@ const INPUT_PLACEHOLDER = "{{input}}";
 function Playground() {
   const [prompt, setPrompt] = useState("");
   const [input, setInput] = useState("");
-  const [model, setModel] = useState<string>(RUN_MODELS[0]);
+  const [model, setModel] = useState("");
   const [maxTokens, setMaxTokens] = useState(1024);
   const [scorerIds, setScorerIds] = useState<string[]>([]);
   const [credentialId, setCredentialId] = useState("");
   const [result, setResult] = useState<PlaygroundResult | null>(null);
+
+  // Only the models the selected key can actually serve. Derived rather than
+  // synced into state: when the key changes, a model belonging to the old
+  // vendor simply stops being the effective one, so there is no window where
+  // the form holds a selection the backend would reject.
+  const models = useModels(credentialId);
+  const effectiveModel = models.includes(model) ? model : (models[0] ?? "");
 
   const { data: scorerData } = useQuery({ queryKey: ["scorers"], queryFn: api.scorers });
   // Filtered rather than showing everything: a judge that wants an expected
@@ -62,7 +69,7 @@ function Playground() {
     mutationFn: () =>
       api.playground({
         prompt,
-        model,
+        model: effectiveModel,
         max_tokens: maxTokens,
         input,
         scorer_ids: scorerIds,
@@ -114,11 +121,11 @@ function Playground() {
           <label className="flex-1">
             <span className="kicker mb-1 block">Model</span>
             <select
-              value={model}
+              value={effectiveModel}
               onChange={(e) => setModel(e.target.value)}
               className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-xs outline-none focus:border-neutral-500"
             >
-              {RUN_MODELS.map((m) => (
+              {models.map((m) => (
                 <option key={m} value={m}>
                   {m}
                 </option>
@@ -126,7 +133,11 @@ function Playground() {
             </select>
           </label>
           <div className="flex-1">
-            <CredentialPicker value={credentialId} onChange={setCredentialId} />
+            <CredentialPicker
+              value={credentialId}
+              onChange={setCredentialId}
+              label="Generate with"
+            />
           </div>
           <label className="w-28">
             <span className="kicker mb-1 block">Max tokens</span>
@@ -187,7 +198,7 @@ function Playground() {
         <div className="flex items-center gap-3">
           <button
             onClick={() => send.mutate()}
-            disabled={!prompt.trim() || send.isPending}
+            disabled={!prompt.trim() || !effectiveModel || send.isPending}
             className="rounded-lg btn-primary px-3 py-1.5 text-xs font-medium disabled:opacity-40"
           >
             {send.isPending ? "Running…" : "Run"}
@@ -239,6 +250,16 @@ function Result({ result }: { result: PlaygroundResult }) {
         <span className="text-neutral-400">{result.response_model}</span>
         <span>{formatDuration(result.latency_ms)}</span>
         <span>{result.credential_name}</span>
+        {/* Only when it differs. A judge is billed to its own model's vendor,
+            so grading a Grok completion with a Claude scorer spends two keys —
+            and an app about watching spend should not make you infer the
+            second one. Silent when both roles used the same key, which is the
+            common case and not worth the noise. */}
+        {result.judged_by.some((n) => n !== result.credential_name) && (
+          <span className="text-neutral-400">
+            judged by {result.judged_by.join(", ")}
+          </span>
+        )}
         {result.cost_usd != null && <span>{formatCost(result.cost_usd)}</span>}
         <span>
           {result.input_tokens} in / {result.output_tokens} out

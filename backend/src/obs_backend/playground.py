@@ -90,16 +90,18 @@ def run(
     if max_tokens < 1 or max_tokens > 32_000:
         raise PlaygroundError("max_tokens must be between 1 and 32000")
 
-    try:
-        llm.provider_for(model)
-    except llm.UnknownModel as exc:
-        raise PlaygroundError(str(exc)) from exc
-
-    # Both resolved before the completion is paid for, not after.
+    # All resolved before the completion is paid for, not after. The model
+    # check moved below the credential because the credential is what says
+    # which provider this call is for.
     scorers = scoring.resolve_scorers(project_id, scorer_ids or [])
     if scorers:
         scoring.check_run_scoring_budget(1, len(scorers))
     credential = credentials.resolve(project_id, credential_id)
+
+    try:
+        llm.check_model_matches(credential.provider, model)
+    except (llm.ModelProviderMismatch, llm.UnknownProvider) as exc:
+        raise PlaygroundError(str(exc)) from exc
 
     rendered = prompt.replace(INPUT_PLACEHOLDER, input_text) if input_text else prompt
 
@@ -108,6 +110,7 @@ def run(
 
     try:
         call = llm.complete(
+            provider=credential.provider,
             model=model,
             prompt=rendered,
             max_tokens=max_tokens,
@@ -130,13 +133,22 @@ def run(
                     prompt=rendered,
                     call=None,
                     error=message,
+                    provider=credential.provider,
                     credential_name=credential.name,
                 )
             ]
         )
         raise PlaygroundError(message) from exc
 
-    cost = estimate_cost_usd(call.response_model, call.input_tokens, call.output_tokens)
+    cost = estimate_cost_usd(
+        credential.provider,
+        call.response_model,
+        call.input_tokens,
+        call.output_tokens,
+        cached_input_tokens=call.cached_input_tokens,
+        cache_write_tokens=call.cache_write_tokens,
+        request_model=model,
+    )
 
     writer.append(
         [
@@ -149,6 +161,7 @@ def run(
                 prompt=rendered,
                 call=call,
                 cost=cost,
+                provider=credential.provider,
                 credential_name=credential.name,
             )
         ]
@@ -159,10 +172,19 @@ def run(
     # output, so say why rather than surfacing its error for a completion the
     # caller can see is blank.
     score_ids: list[str] = []
+    judged_by: list[str] = []
     scoring_skipped = ""
     if scorers and not call.text.strip():
         scoring_skipped = "The model returned no text, so there was nothing to score."
     elif scorers:
+        judged_by = sorted(
+            {
+                c.name
+                for c in scoring.judge_credentials(
+                    project_id, scorers, credential
+                ).values()
+            }
+        )
         score_ids = scoring.score_span(
             project_id,
             trace_id=trace_id,
@@ -171,10 +193,13 @@ def run(
             output_text=call.text,
             scorer_ids=[s.id for s in scorers],
             writer=writer,
+            # The *preferred* key, not the deciding one. score_span resolves a
+            # judge key per scorer from here: this key when it can serve the
+            # scorer's model, otherwise that vendor's default. Generating with
+            # Grok and grading with Claude is the case that matters, and a
+            # judge from the same family as the model it grades is the weakest
+            # judge available.
             credential=credential,
-            # Same key both ways here — this call generated the output and is
-            # paying the judge — but recorded separately, because a later
-            # re-score of the same span need not use the same one.
             generation_credential=credential.name,
         )
 
@@ -191,6 +216,8 @@ def run(
         "latency_ms": call.latency_ms,
         "credential_id": credential.id,
         "credential_name": credential.name,
+        # Which key(s) paid for the judging, which need not be the one above.
+        "judged_by": judged_by,
         "finish_reason": call.stop_reason,
         "score_ids": score_ids,
         "scoring_skipped": scoring_skipped,
@@ -206,6 +233,7 @@ def _span(
     max_tokens: int,
     prompt: str,
     call: llm.Completion | None,
+    provider: str,
     credential_name: str,
     cost: float | None = None,
     error: str = "",
@@ -232,7 +260,7 @@ def _span(
         project_id=project_id,
         service_name=SERVICE_NAME,
         gen_ai_operation_name="chat",
-        gen_ai_provider_name=llm.provider_label(model),
+        gen_ai_provider_name=llm.provider_label(provider),
         gen_ai_request_model=model,
         gen_ai_response_model=call.response_model if call else None,
         gen_ai_response_id=call.response_id if call else None,
@@ -245,6 +273,11 @@ def _span(
         obs_cost_usd=cost,
         obs_latency_seconds=(end - start) / 1e9,
         attributes_json=json.dumps(
-            {"obs.playground": True, "obs.credential": credential_name}
+            {
+                "obs.playground": True,
+                "obs.credential": credential_name,
+                # Cached / reasoning counts, present only when non-zero.
+                **(llm.usage_attributes(call) if call else {}),
+            }
         ),
     )

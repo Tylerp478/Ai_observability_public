@@ -75,6 +75,66 @@ TRACE_SORTS = {
 _HAS_ERROR = "MAX(CASE WHEN s.status_code = 'ERROR' THEN 1 ELSE 0 END)"
 
 
+# How wide one point of the overview series is, by window length.
+#
+# The width scales with the window instead of always being an hour. A series
+# wants roughly 12-30 points at every zoom: fewer and the line has no shape,
+# more and the buckets are narrower than the stroke drawing them. A fixed hour
+# satisfies that at exactly one window — it makes an hour-long window a single
+# point and a month-long one 720.
+#
+# Ordered longest-first, and matched on "the window is at least this long", so
+# a window no preset covers (12h, say) lands on the next step down rather than
+# falling off the end of the table.
+_BUCKET_WIDTHS: tuple[tuple[int, int], ...] = (
+    (720, 86_400),  # 30d → daily,      30 points
+    (168, 21_600),  # 7d  → 6-hourly,   28 points
+    (24, 3_600),    # 24h → hourly,     24 points
+    (6, 900),       # 6h  → 15-minute,  24 points
+    (1, 300),       # 1h  → 5-minute,   12 points
+)
+
+
+def bucket_width(hours: int) -> int:
+    """Seconds per series point for a window of `hours`."""
+    for window, width in _BUCKET_WIDTHS:
+        if hours >= window:
+            return width
+    return _BUCKET_WIDTHS[-1][1]
+
+
+def _period_totals(row: dict[str, Any] | None) -> dict[str, Any]:
+    """Shape one period's aggregate row for the dashboard.
+
+    `None` means the period had no matching calls at all, which is a normal
+    result for the baseline period rather than an error — a key used for the
+    first time yesterday genuinely has no day before.
+
+    Both the current window and the one before it go through here, so a
+    baseline can never be built by different rules than the number it is the
+    baseline for.
+    """
+    prompts = int(row["prompts"] or 0) if row else 0
+    errors = int(row["errors"] or 0) if row else 0
+    p50 = row["p50"] if row else None
+    p95 = row["p95"] if row else None
+    return {
+        "prompts": prompts,
+        "duration_ms": float(row["duration_ms"] or 0) if row else 0.0,
+        "cost_usd": float(row["cost_usd"] or 0) if row else 0.0,
+        "errors": errors,
+        # Derived here rather than in the client so the rate and the two counts
+        # behind it can never disagree about which window they describe.
+        "error_rate": (errors / prompts) if prompts else 0.0,
+        # None, not 0.0: no calls means no latency, and a p95 of 0ms is a claim
+        # about speed that nothing measured.
+        "latency_p50_ms": float(p50) if p50 is not None else None,
+        "latency_p95_ms": float(p95) if p95 is not None else None,
+        "input_tokens": int(row["input_tokens"] or 0) if row else 0,
+        "output_tokens": int(row["output_tokens"] or 0) if row else 0,
+    }
+
+
 class TraceQuery:
     def __init__(self, storage: StorageBackend) -> None:
         self.storage = storage
@@ -286,32 +346,44 @@ class TraceQuery:
         Scoped to gen_ai `chat` spans — one row per prompt actually sent to a
         model. Counting traces would answer a different question, because one
         agent run can hold several prompts, and cost only ever accrues on
-        these spans anyway. Keeping all three totals on the same population
-        means "$0.42 across 31 prompts averaging 800ms" is arithmetic the
-        reader can do in their head and have it come out right.
+        these spans anyway. Keeping every total on the same population means
+        "$0.42 across 31 prompts, p95 2.4s, 2 failed" is arithmetic the reader
+        can do in their head and have it come out right.
 
-        The series is always exactly `hours` buckets ending at the current
-        hour, zero-filled. A chart that silently omits quiet hours compresses
-        its own time axis and turns a gap in traffic into a straight line
-        between two busy points, which is the opposite of what it's for.
+        The series covers exactly `hours` ending at the current bucket,
+        zero-filled. A chart that silently omits quiet buckets compresses its
+        own time axis and turns a gap in traffic into a straight line between
+        two busy points, which is the opposite of what it's for.
+
+        Bucket width comes from the window — see `bucket_width` — and is
+        reported back as `bucket_seconds` so the caller can label the axis. It
+        is not always an hour, which is why the series field is `bucket_start`
+        rather than the `hour_start` it used to be.
 
         `top_traces` rides along rather than living on its own endpoint: it has
         to answer for the same window, source and key as the headline cost, and
         a second endpoint is a second place for those three to drift apart.
         """
         now = int(time.time())
-        # Align to the top of the current hour so buckets are wall-clock hours
-        # rather than offsets from whenever the page happened to load.
-        latest_bucket = now - (now % 3600)
-        buckets = [latest_bucket - i * 3600 for i in range(hours - 1, -1, -1)]
+        width = bucket_width(hours)
+        # Align to the top of the current bucket so points are wall-clock
+        # intervals rather than offsets from whenever the page happened to
+        # load. Daily buckets therefore break at UTC midnight: the server has
+        # no way to know the reader's zone, and a boundary somebody can name
+        # beats one that drifts with the request.
+        latest_bucket = now - (now % width)
+        # Ceiling division, so a window that isn't a whole number of buckets
+        # covers all of itself rather than stopping short.
+        count = max(1, (hours * 3600 + width - 1) // width)
+        buckets = [latest_bucket - i * width for i in range(count - 1, -1, -1)]
         empty = {
             "window_hours": hours,
+            "bucket_seconds": width,
             "source": source or "",
             "credential": credential or "",
-            "prompts": 0,
-            "duration_ms": 0.0,
-            "cost_usd": 0.0,
-            "series": [{"hour_start": b, "prompts": 0} for b in buckets],
+            **_period_totals(None),
+            "previous": _period_totals(None),
+            "series": [{"bucket_start": b, "prompts": 0} for b in buckets],
             "models": [],
             "top_traces": [],
         }
@@ -333,19 +405,20 @@ class TraceQuery:
         )
         SELECT
             -- `//`, not `/`: DuckDB's `/` is float division even on BIGINTs,
-            -- so `/ 3600 * 3600` hands back the original second and every
-            -- bucket key misses. Integer division is what floors to the hour.
-            (start_time_unix_nano // 1000000000 // 3600) * 3600
-                AS hour_start,
-            COUNT(*)                          AS prompts,
-            SUM(COALESCE(duration_ms, 0))     AS duration_ms,
-            SUM(COALESCE(obs_cost_usd, 0))    AS cost_usd
+            -- so `/ w * w` hands back the original second and every bucket key
+            -- misses. Integer division is what floors to the bucket.
+            --
+            -- `width` is interpolated rather than bound because it is ours —
+            -- an int off _BUCKET_WIDTHS, never anything the caller wrote.
+            (start_time_unix_nano // 1000000000 // {width}) * {width}
+                AS bucket_start,
+            COUNT(*)                          AS prompts
         FROM deduped
         WHERE gen_ai_operation_name = 'chat'
           AND start_time_unix_nano >= ?
           {"AND service_name = ?" if source else ""}
           {f"AND {_CREDENTIAL_EXPR} = ?" if credential else ""}
-        GROUP BY hour_start
+        GROUP BY bucket_start
         """
         params: list[Any] = [buckets[0] * 1_000_000_000]
         if source:
@@ -353,6 +426,80 @@ class TraceQuery:
         if credential:
             params.append(credential)
         rows = self._rows(sql, params)
+
+        # Window-level totals.
+        #
+        # A separate query rather than summing the buckets above, because a
+        # percentile is not summable: adding up each hour's p95 produces a
+        # number with no meaning, and averaging them weights a quiet hour the
+        # same as a busy one. The quantile has to see every call at once, so
+        # every total is taken here and the bucket query is left to do the one
+        # thing it is for.
+        #
+        # Same population as the series — gen_ai `chat` spans, same window and
+        # filters — so "$0.42 across 31 prompts, p95 2.4s" is all describing
+        # one set of calls.
+        #
+        # Latency is duration_ms off the chat span, which is wall time for the
+        # provider call. It is deliberately not obs_latency_seconds: that field
+        # is optional and the SDK does not set it on every path, so a
+        # percentile over it would silently describe a subset.
+        # Both periods are measured from the real clock rather than from the
+        # bucket grid, and both are exactly `elapsed` long.
+        #
+        # This is the whole reason the comparison is trustworthy. The newest
+        # bucket is always partial — we are standing somewhere inside it — so
+        # setting the previous period against a *full* window of the nominal
+        # length would put 23h20m of traffic next to 24h of it and print a 3%
+        # fall that is only the clock. Every delta on the dashboard would lean
+        # negative all day and reset at the top of each bucket.
+        elapsed = now - buckets[0]
+        prev_start = buckets[0] - elapsed
+
+        totals_sql = f"""
+        WITH spans AS ({relation}),
+        deduped AS (
+            SELECT * FROM (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY span_id) AS rn
+                FROM spans
+            ) WHERE rn = 1
+        )
+        SELECT
+            -- One scan, two periods. A second query over the same Parquet to
+            -- fetch the baseline would double the read for numbers that have
+            -- to line up with each other anyway.
+            CASE WHEN start_time_unix_nano >= ? THEN 'current' ELSE 'previous' END
+                AS period,
+            COUNT(*)                                     AS prompts,
+            SUM(COALESCE(duration_ms, 0))                AS duration_ms,
+            SUM(COALESCE(obs_cost_usd, 0))               AS cost_usd,
+            -- Per span, not per trace: this is an error *rate* over prompts,
+            -- so the unit has to be the prompt. _HAS_ERROR is the trace-level
+            -- question and answers a different one.
+            SUM(CASE WHEN status_code = 'ERROR' THEN 1 ELSE 0 END) AS errors,
+            -- quantile_cont skips nulls, so a span that recorded no duration
+            -- is left out of the percentile rather than counted as instant.
+            quantile_cont(duration_ms, 0.5)              AS p50,
+            quantile_cont(duration_ms, 0.95)             AS p95,
+            SUM(COALESCE(gen_ai_usage_input_tokens, 0))  AS input_tokens,
+            SUM(COALESCE(gen_ai_usage_output_tokens, 0)) AS output_tokens
+        FROM deduped
+        WHERE gen_ai_operation_name = 'chat'
+          AND start_time_unix_nano >= ?
+          {"AND service_name = ?" if source else ""}
+          {f"AND {_CREDENTIAL_EXPR} = ?" if credential else ""}
+        GROUP BY period
+        """
+        # The CASE binds before the WHERE — DuckDB takes parameters in the
+        # order they appear in the text, not in logical evaluation order.
+        totals_params: list[Any] = [
+            buckets[0] * 1_000_000_000,
+            prev_start * 1_000_000_000,
+            *params[1:],
+        ]
+        by_period = {r["period"]: r for r in self._rows(totals_sql, totals_params)}
+        current = _period_totals(by_period.get("current"))
+        previous = _period_totals(by_period.get("previous"))
 
         # Model mix over the same window, filters and population as the totals
         # above. Deliberately a second query rather than a second GROUP BY on
@@ -441,20 +588,24 @@ class TraceQuery:
         """
         top_rows = self._rows(top_sql, params)
 
-        by_hour = {int(r["hour_start"]): r for r in rows}
+        by_bucket = {int(r["bucket_start"]): r for r in rows}
         return {
             "window_hours": hours,
+            # The axis can't be labelled without it, and deriving it client-side
+            # would mean two copies of _BUCKET_WIDTHS drifting apart.
+            "bucket_seconds": width,
             # Echoed back so the client can tell a filtered zero from an
             # unfiltered one without re-deriving it from its own request.
             "source": source or "",
             "credential": credential or "",
-            "prompts": sum(int(r["prompts"]) for r in rows),
-            "duration_ms": sum(float(r["duration_ms"] or 0) for r in rows),
-            "cost_usd": sum(float(r["cost_usd"] or 0) for r in rows),
+            **current,
+            # The window of the same length immediately before this one. Every
+            # tile reads it to say which way its number is moving.
+            "previous": previous,
             "series": [
                 {
-                    "hour_start": b,
-                    "prompts": int(by_hour[b]["prompts"]) if b in by_hour else 0,
+                    "bucket_start": b,
+                    "prompts": int(by_bucket[b]["prompts"]) if b in by_bucket else 0,
                 }
                 for b in buckets
             ],

@@ -22,6 +22,12 @@ dependencies = [
     # than copying pricing.py keeps one hand-maintained table instead of two
     # that drift the first time Anthropic changes a price.
     "obs-sdk",
+    # The OpenAI-compatible wire format, which is what xAI (Grok) speaks — and
+    # DeepSeek, Groq, Together and a local vLLM, should any of those ever be
+    # registered. One adapter, several vendors; that breadth is why this was
+    # the first non-Anthropic provider wired up. Not a dependency on OpenAI the
+    # company: nothing here calls api.openai.com.
+    "openai>=1.109.0",
     "opentelemetry-proto>=1.44.0",
     "psycopg[binary,pool]>=3.3.4",
     "pyarrow>=25.0.0",
@@ -29,6 +35,7 @@ dependencies = [
     "pydantic-settings>=2.14.2",
     "python-dotenv>=1.2.2",
     "uvicorn[standard]>=0.51.0",
+    "google-genai>=1.0.0",
 ]
 
 [tool.uv.sources]

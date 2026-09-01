@@ -26,6 +26,7 @@ from obs_backend import (
     credentials,
     datasets,
     guardrails,
+    llm,
     otlp,
     playground,
     prompts,
@@ -44,6 +45,7 @@ from obs_backend.query import TraceQuery
 from obs_backend.runner import RunError
 from obs_backend.scoring import ScorerError
 from obs_backend.sessions import SESSION_COOKIE, SessionUser
+from obs_sdk.pricing import PRICING, price_tier
 from obs_backend.storage import build_storage
 from obs_backend.wal import SpanWriter
 
@@ -75,7 +77,6 @@ def _background_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _admin_project_id
-    _settings.require_anthropic_key()
     _settings.require_secret_key()
     _settings.require_admin_credentials()
     _settings.check_password_strength()
@@ -98,6 +99,10 @@ async def lifespan(app: FastAPI):
     attributed = credentials.backfill_generation_credential(_admin_project_id)
     if attributed:
         print(f"[credentials] attributed {attributed} earlier score(s) to the only key")
+
+    # After seeding, not before: an install whose only key is in .env has one
+    # by this point, and warning about it would be a lie.
+    credentials.warn_if_no_keys(_admin_project_id)
 
     # A replay run lives on a thread, so anything still marked running at boot
     # died with the last process. Left alone it would poll forever in the UI.
@@ -309,6 +314,25 @@ async def ingest_traces(
 # Read API
 # --------------------------------------------------------------------------
 
+# Longest window the dashboard will look back over. 30 days, which is the
+# longest range its picker offers.
+#
+# The cap is about scan volume, not about the chart: the series is bucketed to
+# a readable number of points at any window (see bucket_width in query.py), but
+# every window still reads every Parquet file for the project, so a request for
+# a year buys nothing and costs the same scan.
+MAX_WINDOW_HOURS = 720
+
+
+def _window(hours: int) -> int:
+    """Clamp a caller-supplied window to something we will actually serve.
+
+    Clamped rather than 400'd: `hours` arrives from a URL the user can edit,
+    and quietly serving the longest window we support is a better answer to
+    `?hours=99999` than an error page where a dashboard should be.
+    """
+    return max(1, min(hours, MAX_WINDOW_HOURS))
+
 
 @app.get("/api/sources")
 def list_sources(
@@ -354,12 +378,9 @@ def get_overview(
     source: str = "",
     credential: str = "",
 ) -> dict[str, Any]:
-    # Capped: the series is one point per hour and the dashboard draws it in a
-    # fixed-width chart, so a request for a year of buckets would render as an
-    # unreadable smear and scan every Parquet file to build it.
     return _query.overview(
         project_id,
-        hours=max(1, min(hours, 168)),
+        hours=_window(hours),
         source=source or None,
         credential=credential or None,
     )
@@ -442,6 +463,32 @@ class CredentialRequest(BaseModel):
     secret: str
     provider: str = "anthropic"
     make_default: bool = False
+
+
+@app.get("/api/providers")
+def list_providers(
+    user: Annotated[SessionUser, Depends(require_session)],
+) -> dict[str, Any]:
+    """The providers a key can be created for, plus how models rank by price.
+
+    Served rather than duplicated in the frontend so the registry in llm.py and
+    the pricing table stay the single place a provider or a model is added.
+
+    `model_tiers` covers every *priced* model, not just the offered ones — the
+    dashboard colours models that were used, which includes dated ids and
+    anything retired since. Keyed by bare model id rather than by
+    (provider, model): span rows carry the model but not the vendor, and the
+    ids are unique across vendors anyway (`pricing.provider_of_model` relies on
+    the same property, and deliberately answers None if that ever stops holding).
+    """
+    return {
+        "providers": llm.provider_choices(),
+        "model_tiers": {
+            model: tier
+            for (provider, model) in PRICING
+            if (tier := price_tier(provider, model)) is not None
+        },
+    }
 
 
 @app.get("/api/credentials")
@@ -949,13 +996,18 @@ def score_summary(
     judge that produced it, not to the application whose output was judged, so
     there is no service.name to filter on.
     """
+    # Same clamp as the overview, deliberately: this card sits on the dashboard
+    # under the dashboard's range picker, and a scorer summary that silently
+    # capped at 7 days while the page said "Last 30 days" would be wrong in the
+    # least visible way possible.
+    window = _window(hours)
     return {
         "scorers": scoring.average_by_scorer(
             project_id,
-            hours=max(1, min(hours, 168)),
+            hours=window,
             credential=credential or None,
         ),
-        "window_hours": max(1, min(hours, 168)),
+        "window_hours": window,
     }
 
 

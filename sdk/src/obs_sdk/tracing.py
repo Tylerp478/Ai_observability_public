@@ -248,16 +248,50 @@ def traced_completion(
         span.set_attribute("gen_ai.response.model", response.model)
         span.set_attribute("gen_ai.response.id", response.id)
         span.set_attribute("gen_ai.output.messages", completion_text)
-        span.set_attribute("gen_ai.usage.input_tokens", response.usage.input_tokens)
-        span.set_attribute("gen_ai.usage.output_tokens", response.usage.output_tokens)
+        # Anthropic's usage.input_tokens counts only what was neither read
+        # from nor written to the cache, so the prompt total is the sum of all
+        # three. Reporting the raw field would under-count the prompt by
+        # exactly the part caching made cheap — an error that grows the better
+        # caching works. The backend normalizes the same way in llm.py; the few
+        # lines are repeated rather than shared because the SDK is the lower
+        # layer and cannot import from it.
+        usage = response.usage
+        cache_read = getattr(usage, "cache_read_input_tokens", None) or 0
+        cache_write = getattr(usage, "cache_creation_input_tokens", None) or 0
+        input_tokens = usage.input_tokens + cache_read + cache_write
+
+        span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+        span.set_attribute("gen_ai.usage.output_tokens", usage.output_tokens)
+        # obs.* rather than gen_ai.*: the GenAI conventions are pre-stable here
+        # and have not settled on names for these. Written only when non-zero.
+        if cache_read:
+            span.set_attribute("obs.cached_input_tokens", cache_read)
+        if cache_write:
+            span.set_attribute("obs.cache_write_tokens", cache_write)
+        thinking = getattr(
+            getattr(usage, "output_tokens_details", None), "thinking_tokens", None
+        )
+        if thinking:
+            span.set_attribute("obs.reasoning_tokens", thinking)
         # Spec models this as a list — a turn can stop for more than one reason.
         span.set_attribute("gen_ai.response.finish_reasons", [response.stop_reason or "unknown"])
         # Custom (no spec attribute exists). Span duration already covers wall
         # time; this survives into Parquet without a computed column.
         span.set_attribute("obs.latency_seconds", latency_s)
 
+        # "anthropic" is hardcoded because this wrapper is: it takes an
+        # Anthropic client. Making the SDK's instrumentation vendor-agnostic is
+        # its own piece of work (see plan_next_steps.md, Item 5) — it observes
+        # the *user's* app rather than the backend's own spending, so it shares
+        # no code with the provider registry and moves on its own schedule.
         cost_usd = estimate_cost_usd(
-            response.model, response.usage.input_tokens, response.usage.output_tokens
+            "anthropic",
+            response.model,
+            input_tokens,
+            usage.output_tokens,
+            cached_input_tokens=cache_read,
+            cache_write_tokens=cache_write,
+            request_model=model,
         )
         if cost_usd is not None:
             span.set_attribute("obs.cost_usd", cost_usd)

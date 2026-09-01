@@ -1,5 +1,6 @@
 "use client";
 
+import { useModels } from "@/lib/use-models";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Shell } from "../shell";
@@ -13,7 +14,6 @@ import {
   formatDuration,
   INPUT_PLACEHOLDER,
   OUTPUT_PLACEHOLDER,
-  RUN_MODELS,
   SCORER_PRESETS,
   type Scorer,
   type ScorerDraft,
@@ -41,7 +41,7 @@ Answer:
 ${OUTPUT_PLACEHOLDER}
 
 Record passed = true if the answer is acceptable.`,
-  model: RUN_MODELS[0],
+  model: "",
   max_tokens: 1024,
   output_type: "boolean",
   score_min: null,
@@ -322,6 +322,13 @@ function ScorerEditor({
   const [categoryText, setCategoryText] = useState(initial.categories.join(", "));
   const [note, setNote] = useState("");
 
+  // Every model from every provider a key is held for — not narrowed by the
+  // Try-it key below. A scorer's model is what *chooses* which vendor grades
+  // with it: judging routes to whichever key can serve the model, so narrowing
+  // this to one key would hide exactly the cross-vendor judges worth having.
+  const models = useModels();
+  const effectiveModel = models.includes(draft.model) ? draft.model : (models[0] ?? "");
+
   const set = <K extends keyof ScorerDraft>(key: K, value: ScorerDraft[K]) =>
     setDraft((d) => ({ ...d, [key]: value }));
 
@@ -347,6 +354,9 @@ function ScorerEditor({
     mutationFn: async () => {
       const body: ScorerDraft = {
         ...draft,
+        // A draft that was never touched carries "" — the effective model is
+        // what the form has been showing, so it is what gets saved.
+        model: effectiveModel,
         categories:
           draft.output_type === "categorical"
             ? categoryText.split(",").map((c) => c.trim()).filter(Boolean)
@@ -432,11 +442,11 @@ function ScorerEditor({
             Judge model
           </span>
           <select
-            value={draft.model}
+            value={effectiveModel}
             onChange={(e) => set("model", e.target.value)}
             className={FIELD}
           >
-            {RUN_MODELS.map((m) => (
+            {models.map((m) => (
               <option key={m} value={m}>
                 {m}
               </option>
@@ -562,7 +572,7 @@ function ScorerEditor({
       <div className="flex items-center gap-3">
         <button
           type="submit"
-          disabled={!draft.name.trim() || missingOutput || save.isPending}
+          disabled={!draft.name.trim() || !effectiveModel || missingOutput || save.isPending}
           className="rounded-lg btn-primary px-3 py-1.5 text-xs font-medium disabled:opacity-40"
         >
           {save.isPending ? "Saving…" : scorerId ? "Save changes" : "Create scorer"}

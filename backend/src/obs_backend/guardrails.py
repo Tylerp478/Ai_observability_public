@@ -25,7 +25,7 @@ where slow costs nothing but time.
 
 **Failure is a policy, not an exception.** A judge that errors or times out
 leaves the guardrail with no verdict. `on_error` decides what that means, and
-it defaults to allow: fail-closed converts an Anthropic blip into a total
+it defaults to allow: fail-closed converts a provider blip into a total
 outage of the calling application, which is the larger failure. Every response
 carries `degraded`, so a caller who wants the opposite policy gets it in one
 line without this default changing.
@@ -57,7 +57,14 @@ from typing import Any
 from obs_backend import credentials
 from obs_backend.db import get_pool
 from obs_backend.models import Span
-from obs_backend.scoring import Scorer, ScorerError, get_scorer, judge, judge_span
+from obs_backend.scoring import (
+    Scorer,
+    ScorerError,
+    get_scorer,
+    judge,
+    judge_credentials,
+    judge_span,
+)
 from obs_backend.wal import SpanWriter
 
 # What a triggered guardrail does. `flag` records and reports without blocking.
@@ -483,16 +490,29 @@ def evaluate(
             # failure so on_error decides, rather than quietly not screening.
             return _error_result(guardrail, span_id, "Scorer is no longer available")
 
+        # Seeded before the try because the resolve below is inside it: a
+        # missing or undecryptable key leaves `credential` unbound, and the
+        # except path still has to build a span. provider_label("") is "",
+        # which is the case that function's never-raises contract exists for.
+        provider = ""
+
         try:
             # Resolved per guardrail, inside the try: a missing or undecryptable
             # key is a judge failure like any other, so on_error decides what it
             # means rather than it taking down the whole check.
             credential = credentials.resolve(project_id, guardrail.get("credential_id"))
+            # A guardrail's configured key is a preference, same as everywhere
+            # else: its scorer's own model decides which vendor has to be
+            # called, so a Claude safety scorer still works on a guardrail
+            # pinned to an xAI key.
+            credential = judge_credentials(project_id, [scorer], credential)[scorer.id]
+            provider = credential.provider
             result, meta = judge(
                 scorer,
                 input_text=input_text,
                 output_text=output,
                 expected=None,
+                provider=provider,
                 api_key=credential.secret,
                 timeout=GUARDRAIL_TIMEOUT_SECONDS,
             )
@@ -505,6 +525,7 @@ def evaluate(
                 spans.append(
                     judge_span(
                         scorer=scorer,
+                        provider=provider,
                         project_id=project_id,
                         trace_id=trace_id,
                         parent_span_id=root_span_id,
@@ -528,6 +549,7 @@ def evaluate(
             spans.append(
                 judge_span(
                     scorer=scorer,
+                    provider=provider,
                     project_id=project_id,
                     trace_id=trace_id,
                     parent_span_id=root_span_id,

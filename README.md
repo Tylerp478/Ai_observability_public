@@ -74,9 +74,35 @@ login for one person, and the app is not intended to be exposed to the public
 internet. The S3 storage backend is an interface with a stub behind it; the
 filesystem backend is what runs today.
 
-Anthropic is the only provider wired up. `backend/src/obs_backend/llm.py` is
-the seam a second one would go behind: the completion path ports easily, the
-judge path less so, because structured scoring depends on a forced tool call.
+Anthropic, xAI (Grok) and Google Gemini are wired up.
+`backend/src/obs_backend/llm.py` holds a small provider registry: an adapter
+implements `complete`, `tool_call` and `validate_key`, and the credential
+chosen at the point of spending is what selects one — the model id does not
+route, so a model released today works without an edit here. The xAI adapter
+speaks the OpenAI chat-completions wire format, so registering another base URL
+would also cover DeepSeek, Groq, Together or a local vLLM; Gemini has its own
+adapter because going native lets the judge's JSON Schema pass through
+untranslated.
+
+Generating and grading are separate purchases. A scorer's own model decides
+which vendor grades with it, so a Grok completion judged by a Claude scorer
+bills two different keys — recorded separately, and surfaced when they differ.
+
+Cost is keyed on `(provider, model)` in `sdk/src/obs_sdk/pricing.py` and is
+still a hand-maintained table, but it prices four kinds of token rather than
+two: uncached input, cache reads, cache writes and output. Vendors disagree
+about whether their reported input count already includes cached tokens —
+Anthropic's excludes them, an OpenAI-compatible one includes them — so `llm.py`
+normalizes both to a total before anything is priced. Reasoning tokens are
+recorded but not priced separately; they are already inside the output count
+and billed at the output rate.
+
+Long-context tiers and promotional windows are expressible in the same
+structure. What is *not* modelled: Anthropic's 1-hour cache-write TTL, which is
+priced differently from the 5-minute one — nothing here sets `cache_control`,
+so no call can currently produce one.
 
 `plan_next_steps.md` carries what is planned next and the reasoning behind the
 decisions already made, including the bugs found along the way.
+`gotchas.md` is the short form of the same thing — the traps worth knowing
+before touching a page, organised by where you'd hit them.

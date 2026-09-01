@@ -6,12 +6,12 @@ import { useParams, useRouter } from "next/navigation";
 import { useState } from "react";
 import { Shell } from "../../shell";
 import { CredentialPicker } from "@/components/credential-picker";
+import { useModels } from "@/lib/use-models";
 import {
   api,
   ApiError,
   formatCost,
   INPUT_PLACEHOLDER,
-  RUN_MODELS,
   relativeTime,
   type Prompt,
   type PromptVersion,
@@ -177,12 +177,21 @@ function RunForm({
   // this preview is never what gets recorded.
   const resolved = resolveVersion(selectedPrompt, pick);
 
+  // Only what the selected key can serve.
+  const models = useModels(credentialId);
+
   // Derived, not stored. A version carries the model and budget it was written
   // for; an explicit choice in the form wins over it until the selection moves
   // to a different version, which drops the override with it.
-  const model =
+  //
+  // The key has the last word. A version written against a Claude model cannot
+  // run on an xAI key, so when the two disagree the form falls back to a model
+  // the chosen key can actually serve — and shows it, rather than letting the
+  // run fail on submit for a mismatch the form could see.
+  const preferredModel =
     modelOverride ??
-    (typeof resolved?.config.model === "string" ? resolved.config.model : RUN_MODELS[0]);
+    (typeof resolved?.config.model === "string" ? resolved.config.model : models[0]);
+  const model = models.includes(preferredModel) ? preferredModel : (models[0] ?? "");
   const maxTokens =
     maxTokensOverride ??
     (typeof resolved?.config.max_tokens === "number" ? resolved.config.max_tokens : 1024);
@@ -359,7 +368,7 @@ function RunForm({
                 onChange={(e) => setModelOverride(e.target.value)}
                 className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-2 py-1.5 text-xs outline-none focus:border-neutral-500"
               >
-                {RUN_MODELS.map((m) => (
+                {models.map((m) => (
                   <option key={m} value={m}>
                     {m}
                   </option>
@@ -425,7 +434,7 @@ function RunForm({
           <CredentialPicker
             value={credentialId}
             onChange={setCredentialId}
-            label="Bill to"
+            label="Generate with"
           />
 
           {start.isError && (
@@ -437,7 +446,7 @@ function RunForm({
           <div className="flex items-center gap-3">
             <button
               type="submit"
-              disabled={missingPlaceholder || start.isPending}
+              disabled={missingPlaceholder || !model || start.isPending}
               className="rounded-lg btn-primary px-3 py-1.5 text-xs font-medium disabled:opacity-40"
             >
               {start.isPending ? "Starting…" : `Run ${itemCount} cases`}

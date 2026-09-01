@@ -1,6 +1,6 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { api, type ScorerAverage } from "@/lib/api";
 
 /**
@@ -66,6 +66,10 @@ export function ScoreAverages({
     queryKey: ["score-summary", hours, credential],
     queryFn: () => api.scoreSummary(hours, credential),
     refetchInterval: 30_000,
+    // Hold the previous window's bars while a new one loads. `hours` is part
+    // of the key, so without this every range switch empties this card to
+    // "Loading…" and the row beside it jumps as the card collapses.
+    placeholderData: keepPreviousData,
   });
 
   const scorers = data?.scorers ?? [];

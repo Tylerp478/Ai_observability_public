@@ -58,8 +58,8 @@ from typing import Any
 
 from obs_sdk.pricing import estimate_cost_usd
 
-from obs_backend import llm, prompts
-from obs_backend.credentials import Credential
+from obs_backend import credentials, llm, prompts
+from obs_backend.credentials import Credential, CredentialError
 from obs_backend.db import get_pool
 from obs_backend.models import Span
 from obs_backend.wal import SpanWriter
@@ -670,6 +670,7 @@ def judge(
     input_text: str,
     output_text: str,
     expected: str | None,
+    provider: str,
     api_key: str,
     timeout: float | None = None,
 ) -> tuple[JudgeResult, dict[str, Any]]:
@@ -689,6 +690,7 @@ def judge(
     # The forced tool call itself lives in llm.py; what stays here is what the
     # verdict has to satisfy to count as one.
     call = llm.tool_call(
+        provider=provider,
         model=scorer.model,
         prompt=prompt,
         max_tokens=scorer.max_tokens,
@@ -709,7 +711,7 @@ def judge(
         hint = (
             " The judge hit max_tokens before finishing its answer — raise the "
             "scorer's max_tokens."
-            if call.stop_reason == "max_tokens"
+            if call.truncated
             else ""
         )
         raise ScorerError(f"Judge did not return a {TOOL_NAME} call.{hint}")
@@ -717,9 +719,13 @@ def judge(
     value, label, passed = _interpret(scorer, call.payload)
 
     cost = estimate_cost_usd(
+        provider,
         call.response_model,
         call.input_tokens,
         call.output_tokens,
+        cached_input_tokens=call.cached_input_tokens,
+        cache_write_tokens=call.cache_write_tokens,
+        request_model=scorer.model,
         on=datetime.now(tz=timezone.utc).date(),
     )
 
@@ -741,6 +747,7 @@ def judge(
         "start_nano": call.start_nano,
         "end_nano": call.end_nano,
         "payload": call.payload,
+        "usage_attributes": llm.usage_attributes(call),
     }
     return result, meta
 
@@ -748,6 +755,7 @@ def judge(
 def judge_span(
     *,
     scorer: Scorer,
+    provider: str,
     project_id: str,
     trace_id: str,
     parent_span_id: str,
@@ -776,7 +784,7 @@ def judge_span(
         project_id=project_id,
         service_name=service_name,
         gen_ai_operation_name="chat",
-        gen_ai_provider_name=llm.provider_label(scorer.model),
+        gen_ai_provider_name=llm.provider_label(provider),
         gen_ai_request_model=scorer.model,
         gen_ai_response_model=meta.get("response_model"),
         gen_ai_response_id=meta.get("response_id"),
@@ -794,6 +802,8 @@ def judge_span(
                 "obs.scorer_id": scorer.id,
                 "obs.scorer_name": scorer.name,
                 "obs.scorer_output_type": scorer.output_type,
+                # Absent on the error path, where meta holds only the timings.
+                **meta.get("usage_attributes", {}),
                 **(extra or {}),
             }
         ),
@@ -805,6 +815,62 @@ def judge_span(
 # --------------------------------------------------------------------------
 
 
+def judge_credentials(
+    project_id: str,
+    scorers: list[Scorer],
+    preferred: Credential,
+) -> dict[str, Credential]:
+    """Which key pays for each scorer's judge call.
+
+    **Generating and grading are separate purchases.** Before a second provider
+    existed they were always the same key, so the Playground handed one
+    credential to both and said so in a comment. That stops working the moment
+    the interesting case arrives: generate with Grok, grade with Claude, or the
+    reverse. Cross-vendor grading is most of the value of not being tied to one
+    vendor — a judge from the same family as the model it is judging is the
+    weakest judge available.
+
+    `preferred` is the caller's chosen key — the one that generated the output.
+    It is honoured whenever it *can* serve the scorer: same vendor, or a model
+    this build cannot attribute (where refusing would block a model released
+    this morning). Otherwise the scorer falls back to that vendor's default
+    key, which is an explicit designation rather than a guess.
+
+    Resolved once, up front, for two reasons: a job doing 40 judge calls should
+    not decrypt a secret 40 times, and a missing key should fail before any of
+    them is paid for rather than partway through.
+    """
+    from obs_sdk.pricing import provider_of_model
+
+    by_provider: dict[str, Credential] = {preferred.provider: preferred}
+    out: dict[str, Credential] = {}
+
+    for scorer in scorers:
+        needed = provider_of_model(scorer.model)
+        if needed is None or needed == preferred.provider:
+            out[scorer.id] = preferred
+            continue
+        if needed not in by_provider:
+            try:
+                by_provider[needed] = credentials.resolve_for_provider(
+                    project_id, needed
+                )
+            except CredentialError as exc:
+                # Names the scorer, its model and the vendor, because the fix
+                # is specific and none of the three is guessable from the
+                # others: this scorer grades with a model you hold no key for.
+                label = llm.provider_label_for(needed)
+                raise ScorerError(
+                    f"Scorer {scorer.name!r} grades with {scorer.model}, which "
+                    f"needs a key from {label}, and none is configured. Add one "
+                    f"on the Keys page — the key that generated the output "
+                    f"cannot pay for a judge from a different provider."
+                ) from exc
+        out[scorer.id] = by_provider[needed]
+
+    return out
+
+
 def _create_score_rows(
     *,
     project_id: str,
@@ -812,7 +878,7 @@ def _create_score_rows(
     targets: list[dict[str, Any]],
     target_kind: str,
     run_id: str | None,
-    credential_id: str,
+    credential_for: dict[str, Credential],
     generation_credential: str,
 ) -> list[tuple[Scorer, _Target]]:
     """Materialize pending score rows so the UI can show work in flight.
@@ -852,7 +918,9 @@ def _create_score_rows(
                     # while its own scoring job is in flight must not have the
                     # new version credited with verdicts the old one produced.
                     scorer.version_id,
-                    credential_id,
+                    # The key that will actually pay for *this* scorer, which
+                    # is not necessarily the one that generated the output.
+                    credential_for[scorer.id].id,
                     generation_credential,
                 )
             )
@@ -885,7 +953,7 @@ def _execute_job(
     trace_id: str,
     root_name: str,
     root_attributes: dict[str, Any],
-    credential: Credential,
+    credential_for: dict[str, Credential],
 ) -> None:
     """Run every (scorer, target) pair and emit one trace for the job.
 
@@ -898,13 +966,15 @@ def _execute_job(
     spans: list[Span] = []
     spans_lock = threading.Lock()
 
-    # Tagged onto the root span and every judge span below, so "what did this
-    # key cost me?" is answerable from the trace store as well as from the
-    # scores table. The name, never the key.
-    root_attributes = {**root_attributes, "obs.credential": credential.name}
-
+    # Tagged onto each judge span, so "what did this key cost me?" is
+    # answerable from the trace store as well as from the scores table. The
+    # name, never the key. Per scorer rather than per job now: one job can
+    # legitimately span two vendors, and a root-level label would name only
+    # whichever key happened to be first.
     def work(pair: tuple[Scorer, _Target]) -> bool:
         scorer, target = pair
+        credential = credential_for[scorer.id]
+        span_attributes = {**root_attributes, "obs.credential": credential.name}
         _write_score(target.score_id, status="running")
         span_id = _hex(8)
         meta: dict[str, Any] = {"start_nano": time.time_ns()}
@@ -915,6 +985,7 @@ def _execute_job(
                 input_text=target.input,
                 output_text=target.output,
                 expected=target.expected,
+                provider=credential.provider,
                 api_key=credential.secret,
             )
         except Exception as exc:
@@ -933,6 +1004,7 @@ def _execute_job(
                 spans.append(
                     judge_span(
                         scorer=scorer,
+                        provider=credential.provider,
                         project_id=project_id,
                         trace_id=trace_id,
                         parent_span_id=root_span_id,
@@ -940,7 +1012,7 @@ def _execute_job(
                         meta=meta,
                         result=None,
                         error=message,
-                        extra={"obs.score_id": target.score_id, **root_attributes},
+                        extra={"obs.score_id": target.score_id, **span_attributes},
                     )
                 )
             return False
@@ -963,13 +1035,14 @@ def _execute_job(
             spans.append(
                 judge_span(
                     scorer=scorer,
+                    provider=credential.provider,
                     project_id=project_id,
                     trace_id=trace_id,
                     parent_span_id=root_span_id,
                     span_id=span_id,
                     meta=meta,
                     result=result,
-                    extra={"obs.score_id": target.score_id, **root_attributes},
+                    extra={"obs.score_id": target.score_id, **span_attributes},
                 )
             )
         return True
@@ -1095,13 +1168,17 @@ def score_run(
         }
         for r in rows
     ]
+    # Resolved before any row is written: a scorer wanting a vendor with no
+    # key should fail the request, not leave half a job pending.
+    credential_for = judge_credentials(project_id, scorers, credential)
+
     pairs = _create_score_rows(
         project_id=project_id,
         scorers=scorers,
         targets=targets,
         target_kind="run_item",
         run_id=run_id,
-        credential_id=credential.id,
+        credential_for=credential_for,
         # run[3] is the run's own key, deliberately not `credential`: a run
         # re-scored later with a different key was still generated by the one
         # it recorded at creation.
@@ -1117,7 +1194,7 @@ def score_run(
             trace_id=trace_id,
             root_name=f"eval scoring {run[1] or run_id[:8]}",
             root_attributes={"obs.run_id": run_id},
-            credential=credential,
+            credential_for=credential_for,
         ),
         f"score-{run_id[:8]}",
     )
@@ -1150,6 +1227,11 @@ def score_span(
 
     check_run_scoring_budget(1, len(scorers))
 
+    # A Grok completion graded by a Claude judge is the normal case now, not an
+    # edge one, so the judge's key is resolved per scorer rather than inherited
+    # from whatever generated the output.
+    credential_for = judge_credentials(project_id, scorers, credential)
+
     pairs = _create_score_rows(
         project_id=project_id,
         scorers=scorers,
@@ -1164,7 +1246,7 @@ def score_span(
         ],
         target_kind="span",
         run_id=None,
-        credential_id=credential.id,
+        credential_for=credential_for,
         generation_credential=generation_credential,
     )
 
@@ -1177,7 +1259,7 @@ def score_span(
             trace_id=judge_trace_id,
             root_name=f"span scoring {span_id}",
             root_attributes={"obs.target_trace_id": trace_id, "obs.target_span_id": span_id},
-            credential=credential,
+            credential_for=credential_for,
         ),
         f"score-span-{span_id[:8]}",
     )
@@ -1211,6 +1293,11 @@ def try_scorer(
     if not output_text.strip():
         raise ScorerError("Give the judge some output text to score")
 
+    # Same rule as a real scoring job: the scorer's own model decides which
+    # key pays, so previewing a Claude scorer works while an xAI key happens to
+    # be selected.
+    credential = judge_credentials(project_id, [scorer], credential)[scorer.id]
+
     trace_id = _hex(16)
     span_id = _hex(8)
     meta: dict[str, Any] = {"start_nano": time.time_ns()}
@@ -1223,6 +1310,7 @@ def try_scorer(
             input_text=input_text,
             output_text=output_text,
             expected=expected,
+            provider=credential.provider,
             api_key=credential.secret,
         )
     except Exception as exc:
@@ -1232,6 +1320,7 @@ def try_scorer(
             [
                 judge_span(
                     scorer=scorer,
+                    provider=credential.provider,
                     project_id=project_id,
                     trace_id=trace_id,
                     parent_span_id="",
@@ -1247,6 +1336,7 @@ def try_scorer(
 
     span = judge_span(
         scorer=scorer,
+        provider=credential.provider,
         project_id=project_id,
         trace_id=trace_id,
         parent_span_id="",

@@ -14,6 +14,67 @@ import { api, ApiError, formatCost, relativeTime } from "@/lib/api";
  * spans land in — but the page used to show only the first, which made it read
  * as a general credential store and left no way to see what was reporting.
  */
+/**
+ * A section that stays out of the way until it is wanted.
+ *
+ * `<details>` rather than a state-driven panel: it is keyboard-operable and
+ * findable by in-page search without any of that being written here, and a
+ * collapsed section that Cmd-F cannot find is a worse trade than the styling
+ * costs to override.
+ *
+ * The summary keeps a count, because the reason to open one of these is
+ * usually to check whether something is there — and a collapsed header that
+ * already answers that saves the click entirely.
+ */
+function Collapsible({
+  title,
+  hint,
+  count,
+  open,
+  onOpenChange,
+  children,
+}: {
+  title: string;
+  hint?: string;
+  count?: number;
+  /** Omit for uncontrolled. Pass to force open — see the Ingest keys note. */
+  open?: boolean;
+  onOpenChange?: (next: boolean) => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <details
+      className="group rounded-xl border border-neutral-800 bg-neutral-900/40"
+      {...(open === undefined ? {} : { open })}
+      onToggle={(e) => onOpenChange?.(e.currentTarget.open)}
+    >
+      <summary className="flex cursor-pointer list-none items-center gap-2.5 px-3.5 py-3 [&::-webkit-details-marker]:hidden">
+        <svg
+          viewBox="0 0 12 12"
+          aria-hidden="true"
+          className="h-3 w-3 shrink-0 text-neutral-500 transition-transform group-open:rotate-90"
+        >
+          <path d="M4 2l4 4-4 4" fill="none" stroke="currentColor" strokeWidth="1.5" />
+        </svg>
+        <h2 className="text-base font-semibold">{title}</h2>
+        {count !== undefined && (
+          <span className="rounded bg-neutral-800 px-1.5 py-0.5 text-[10px] tabular-nums text-neutral-400">
+            {count}
+          </span>
+        )}
+        {hint && (
+          <span className="ml-auto hidden truncate text-[11px] text-neutral-500 sm:block">
+            {hint}
+          </span>
+        )}
+      </summary>
+      <div className="space-y-3 border-t border-neutral-800 px-3.5 pb-3.5 pt-3.5">
+        {children}
+      </div>
+    </details>
+  );
+}
+
 export default function KeysPage() {
   return (
     <Shell>
@@ -33,6 +94,7 @@ function Keys() {
   // the backend stores a hash and cannot show it again.
   const [freshKey, setFreshKey] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [open, setOpen] = useState(false);
 
   const { data, isLoading } = useQuery({ queryKey: ["keys"], queryFn: api.keys });
 
@@ -50,16 +112,25 @@ function Keys() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["keys"] }),
   });
 
+  const keys = data?.keys ?? [];
+
   return (
-    <div className="space-y-5">
-      <div>
-        <h1 className="text-base font-semibold">Ingest keys</h1>
-        <p className="mt-1 text-xs text-neutral-500">
-          A key lets the SDK send traces in. It is not a login, and it is not a
-          credential for anything this app reads from — traffic is pushed here,
-          never pulled.
-        </p>
-      </div>
+    // Forced open while a fresh key is on screen. That plaintext is shown
+    // exactly once and the backend keeps only a hash, so a collapse that
+    // scrolled it away would destroy it — the Dismiss button on the banner is
+    // the way out, and it clears freshKey, which releases this.
+    <Collapsible
+      title="Ingest keys"
+      hint="how the SDK sends traces in"
+      count={keys.filter((k) => !k.revoked).length}
+      open={open || freshKey !== null}
+      onOpenChange={setOpen}
+    >
+      <p className="text-xs text-neutral-500">
+        A key lets the SDK send traces in. It is not a login, and it is not a
+        credential for anything this app reads from — traffic is pushed here,
+        never pulled.
+      </p>
 
       {freshKey && (
         <div className="rounded-xl border border-amber-800 bg-amber-950/40 p-3.5">
@@ -116,7 +187,7 @@ function Keys() {
         <p className="text-sm text-neutral-500">Loading…</p>
       ) : (
         <ul className="space-y-2">
-          {(data?.keys ?? []).map((k) => (
+          {keys.map((k) => (
             <li
               key={k.id}
               className={`flex items-center justify-between gap-3 rounded-xl border p-3 ${
@@ -153,7 +224,7 @@ function Keys() {
           ))}
         </ul>
       )}
-    </div>
+    </Collapsible>
   );
 }
 
@@ -162,7 +233,7 @@ function Keys() {
 // --------------------------------------------------------------------------
 
 /**
- * The Anthropic keys this app spends on — the opposite direction from an
+ * The provider keys this app spends on — the opposite direction from an
  * ingest key.
  *
  * An ingest key lets something else write *to* us; a provider key lets us call
@@ -174,7 +245,18 @@ function ProviderKeys() {
   const qc = useQueryClient();
   const [name, setName] = useState("");
   const [secret, setSecret] = useState("");
+  const [provider, setProvider] = useState("anthropic");
   const [adding, setAdding] = useState(false);
+
+  // Served from the backend registry rather than hardcoded here, so adding a
+  // provider stays one change in llm.py.
+  const { data: providerData } = useQuery({
+    queryKey: ["providers"],
+    queryFn: api.providers,
+  });
+  const providers = providerData?.providers ?? [];
+  const providerLabel = (p: string) =>
+    providers.find((x) => x.name === p)?.label ?? p;
 
   const { data, isLoading } = useQuery({
     queryKey: ["credentials"],
@@ -187,10 +269,12 @@ function ProviderKeys() {
   };
 
   const create = useMutation({
-    mutationFn: () => api.createCredential({ name: name.trim(), secret: secret.trim() }),
+    mutationFn: () =>
+      api.createCredential({ name: name.trim(), secret: secret.trim(), provider }),
     onSuccess: () => {
       setName("");
       setSecret("");
+      setProvider("anthropic");
       setAdding(false);
       invalidate();
     },
@@ -211,9 +295,9 @@ function ProviderKeys() {
   return (
     <div className="space-y-3">
       <div>
-        <h2 className="text-base font-semibold">Provider keys</h2>
+        <h1 className="text-base font-semibold">Provider keys</h1>
         <p className="mt-1 text-xs text-neutral-500">
-          The Anthropic keys this app spends on. Runs, scorers, guardrails and the
+          The provider keys this app spends on. Runs, scorers, guardrails and the
           Playground bill to the default unless you pick another. Stored encrypted;
           the key itself is never shown again after you save it.
         </p>
@@ -238,7 +322,8 @@ function ProviderKeys() {
                   )}
                 </p>
                 <p className="mt-0.5 font-mono text-[11px] text-neutral-500">
-                  ···{c.last4}
+                  {providerLabel(c.provider)}
+                  {" · "}···{c.last4}
                   {" · "}
                   {formatCost(c.spend_usd)} spent
                   {c.last_used_at
@@ -283,6 +368,17 @@ function ProviderKeys() {
           }}
           className="space-y-2 rounded-xl border border-neutral-800 bg-neutral-900 p-3"
         >
+          <select
+            value={provider}
+            onChange={(e) => setProvider(e.target.value)}
+            className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 text-sm outline-none focus:border-neutral-500"
+          >
+            {providers.map((p) => (
+              <option key={p.name} value={p.name}>
+                {p.label}
+              </option>
+            ))}
+          </select>
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -296,7 +392,7 @@ function ProviderKeys() {
             onChange={(e) => setSecret(e.target.value)}
             type="password"
             autoComplete="off"
-            placeholder="sk-ant-…"
+            placeholder={providers.find((p) => p.name === provider)?.key_hint ?? ""}
             className="w-full rounded-lg border border-neutral-700 bg-neutral-950 px-3 py-2 font-mono text-sm outline-none focus:border-neutral-500"
           />
           <div className="flex items-center gap-3">
@@ -321,7 +417,7 @@ function ProviderKeys() {
             {/* Says what "Save" does before it does it: a rejected key is never
                 stored, so this is a check, not a write-then-discover. */}
             <span className="text-[11px] text-neutral-500">
-              Verified with Anthropic before saving
+              Verified with {providerLabel(provider)} before saving
             </span>
           </div>
         </form>
@@ -356,19 +452,16 @@ function Sources() {
   const sources = data?.sources ?? [];
 
   return (
-    <div className="space-y-3">
-      <div>
-        <h2 className="text-base font-semibold">Sources</h2>
-        <p className="mt-1 text-xs text-neutral-500">
-          Everything sending spans to this project. Set{" "}
-          <code className="font-mono text-[11px] text-neutral-400">OBS_SERVICE_NAME</code>{" "}
-          in an instrumented app to name it here, then filter the{" "}
-          <Link href="/" className="text-sky-400 hover:underline">
-            Overview
-          </Link>{" "}
-          by it.
-        </p>
-      </div>
+    <Collapsible title="Sources" hint="what has reported in" count={sources.length}>
+      <p className="text-xs text-neutral-500">
+        Everything sending spans to this project. Set{" "}
+        <code className="font-mono text-[11px] text-neutral-400">OBS_SERVICE_NAME</code>{" "}
+        in an instrumented app to name it here, then filter the{" "}
+        <Link href="/" className="text-sky-400 hover:underline">
+          Overview
+        </Link>{" "}
+        by it.
+      </p>
 
       {isLoading ? (
         <p className="text-sm text-neutral-500">Loading…</p>
@@ -376,7 +469,7 @@ function Sources() {
         <div className="rounded-xl border border-dashed border-neutral-800 px-6 py-8 text-center">
           <p className="text-sm text-neutral-300">Nothing has reported in yet</p>
           <p className="mt-2 text-xs text-neutral-500">
-            Create a key above, then point the SDK at this backend.
+            Create an ingest key, then point the SDK at this backend.
           </p>
         </div>
       ) : (
@@ -404,6 +497,6 @@ function Sources() {
           ))}
         </ul>
       )}
-    </div>
+    </Collapsible>
   );
 }

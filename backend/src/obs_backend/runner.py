@@ -191,6 +191,19 @@ def create_run(
     # which key paid for it even after the default moves.
     credential = credentials.resolve(project_id, credential_id)
 
+    # The one place this check earns the most: a model that cannot run on the
+    # chosen key would otherwise be discovered once per test case, each costing
+    # a round trip, before the run gave up.
+    #
+    # Re-raised as RunError so it lands as a 400 with the rest of this
+    # function's validation. The POST endpoint catches RunError; a bare
+    # ValueError from llm would escape it and surface as a 500 for what is
+    # plainly a bad request.
+    try:
+        llm.check_model_matches(credential.provider, model)
+    except (llm.ModelProviderMismatch, llm.UnknownProvider) as exc:
+        raise RunError(str(exc)) from exc
+
     run_id = _hex(16)
     trace_id = _hex(16)  # 32 hex chars, matching an OTLP trace id
 
@@ -456,6 +469,7 @@ def _run_one(
 
     try:
         call = llm.complete(
+            provider=credential.provider,
             model=model,
             prompt=prompt,
             max_tokens=max_tokens,
@@ -483,7 +497,7 @@ def _run_one(
             project_id=project_id,
             service_name="obs-runner",
             gen_ai_operation_name="chat",
-            gen_ai_provider_name=llm.provider_label(model),
+            gen_ai_provider_name=llm.provider_label(credential.provider),
             gen_ai_request_model=model,
             gen_ai_request_max_tokens=max_tokens,
             gen_ai_input_messages=prompt,
@@ -504,9 +518,13 @@ def _run_one(
     # instant here, but passing it explicitly keeps this correct if a run is
     # ever re-costed and matters for models on time-boxed intro pricing.
     cost = estimate_cost_usd(
+        credential.provider,
         call.response_model,
         call.input_tokens,
         call.output_tokens,
+        cached_input_tokens=call.cached_input_tokens,
+        cache_write_tokens=call.cache_write_tokens,
+        request_model=model,
         on=datetime.now(tz=timezone.utc).date(),
     )
     finish_reason = call.stop_reason
@@ -534,7 +552,7 @@ def _run_one(
         project_id=project_id,
         service_name="obs-runner",
         gen_ai_operation_name="chat",
-        gen_ai_provider_name=llm.provider_label(model),
+        gen_ai_provider_name=llm.provider_label(credential.provider),
         gen_ai_request_model=model,
         gen_ai_response_model=call.response_model,
         gen_ai_response_id=call.response_id,
@@ -548,6 +566,8 @@ def _run_one(
         obs_latency_seconds=latency_ms / 1000,
         attributes_json=json.dumps(
             {
+                # Cached / reasoning counts, present only when non-zero.
+                **llm.usage_attributes(call),
                 "obs.run_id": run_id,
                 "obs.dataset_item_id": item.id,
                 "obs.credential": credential.name,

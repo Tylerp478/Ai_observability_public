@@ -1,5 +1,6 @@
 "use client";
 
+import { useModels } from "@/lib/use-models";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
@@ -10,7 +11,6 @@ import {
   api,
   ApiError,
   INPUT_PLACEHOLDER,
-  RUN_MODELS,
   type PromptVersion,
 } from "@/lib/api";
 
@@ -167,14 +167,17 @@ function VersionEditor({
   const queryClient = useQueryClient();
   const [template, setTemplate] = useState(latest.template);
   const [note, setNote] = useState("");
-  const [model, setModel] = useState(String(latest.config.model ?? RUN_MODELS[0]));
+  const [model, setModel] = useState(String(latest.config.model ?? ""));
   const [maxTokens, setMaxTokens] = useState(Number(latest.config.max_tokens ?? 1024));
+
+  const models = useModels();
+  const effectiveModel = models.includes(model) ? model : (models[0] ?? "");
 
   const save = useMutation({
     mutationFn: () =>
       api.addPromptVersion(promptId, {
         template,
-        config: { model, max_tokens: maxTokens },
+        config: { model: effectiveModel, max_tokens: maxTokens },
         note,
       }),
     onSuccess: (result) => {
@@ -226,11 +229,11 @@ function VersionEditor({
             Default model
           </span>
           <select
-            value={model}
+            value={effectiveModel}
             onChange={(e) => setModel(e.target.value)}
             className={FIELD}
           >
-            {RUN_MODELS.map((m) => (
+            {models.map((m) => (
               <option key={m} value={m}>
                 {m}
               </option>
@@ -281,7 +284,7 @@ function VersionEditor({
       <div className="flex items-center gap-3">
         <button
           type="submit"
-          disabled={missingPlaceholder || save.isPending}
+          disabled={missingPlaceholder || !effectiveModel || save.isPending}
           className="rounded-lg btn-primary px-3 py-1.5 text-xs font-medium disabled:opacity-40"
         >
           {save.isPending ? "Saving…" : `Save as v${latest.version + 1}`}

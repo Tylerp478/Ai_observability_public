@@ -1,7 +1,8 @@
 "use client";
 
+import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
-import { type Overview } from "@/lib/api";
+import { api, type Overview } from "@/lib/api";
 
 /**
  * Share of prompts by model, as a donut.
@@ -9,15 +10,29 @@ import { type Overview } from "@/lib/api";
  * **Why a ramp and not a categorical palette.** This app reserves red, amber
  * and emerald for pass/warn/fail (globals.css says so explicitly), which leaves
  * exactly one non-status hue — not enough for four distinct identities. It
- * turns out not to matter, because these categories are *ordered*: haiku →
- * sonnet → opus → fable is a real capability and price ladder, and an ordinal
- * ramp on one hue is the correct encoding for an ordered scale. The four steps
- * are validated (single hue, monotone lightness, adjacent ΔL ≥ 0.06, light end
- * clearing the card surface at 3.41:1).
+ * turns out not to matter, because these categories are *ordered*, and an
+ * ordinal ramp on one hue is the correct encoding for an ordered scale. The
+ * four steps are validated (single hue, monotone lightness, adjacent ΔL ≥ 0.06,
+ * light end clearing the card surface at 3.41:1).
+ *
+ * **What the ramp encodes is price, and it is read from the pricing table.**
+ * It used to be a hardcoded ladder of `claude-*` prefixes, which greyed out
+ * every model the moment a second provider existed. The ordering it was really
+ * expressing was cost, so the tier now comes from `/api/providers`, banded on
+ * the output rate the billing code already uses. A model cannot be coloured as
+ * a tier it is not priced as, and a new vendor needs no edit here.
+ *
+ * The consequence worth stating: **the ramp does not encode vendor.** A Grok
+ * and a Claude model of the same price band are the same colour, which is the
+ * honest reading of a price scale. Vendor is carried by the legend, where the
+ * model names say it plainly — and the legend is already load-bearing, since
+ * the slices are never colour-alone.
  *
  * **Colour follows the model, never its share.** modelColor is a lookup on the
  * model name, so filtering the dashboard cannot repaint the survivors — a
- * reader who learned "sonnet is the mid purple" keeps that.
+ * reader who learned "sonnet is the mid purple" keeps that. The tier bands are
+ * fixed rather than derived from whichever models happen to be present, for
+ * the same reason.
  *
  * **The legend names the models; the numbers live on hover.** That is a
  * deliberate exception to "never gate a value behind a tooltip", made because
@@ -30,26 +45,28 @@ import { type Overview } from "@/lib/api";
 // ramp (300/400/500/600) rather than invented.
 const TIER_RAMP = ["#d2cefd", "#b5abfc", "#968ae0", "#796cbf"];
 
-// Matched with startsWith, so a dated id (claude-haiku-4-5-20251001) lands on
-// the same rung as its bare form.
-const TIERS = ["claude-haiku", "claude-sonnet", "claude-opus", "claude-fable"];
-
-// Anything off the ladder — a typo'd model, or one newer than this list.
-// Neutral rather than a fifth rung, because it has no place in the order.
+// Anything the pricing table cannot rank — a model retired before it was
+// priced, or one newer than the table. Neutral rather than a fifth rung,
+// because it has no place in the order.
 const OFF_LADDER = "#595d6c";
 
 // Past this many slices a donut stops being readable, so the tail folds into
 // one "Other" segment rather than growing more colours.
 const MAX_SLICES = 6;
 
-function modelColor(model: string): string {
-  const i = TIERS.findIndex((t) => model.startsWith(t));
-  return i === -1 ? OFF_LADDER : TIER_RAMP[i];
+function modelColor(model: string, tiers: Record<string, number>): string {
+  const tier = tiers[model];
+  return tier === undefined ? OFF_LADDER : (TIER_RAMP[tier] ?? OFF_LADDER);
 }
 
-/** Short label for the legend: the tier, without the version tail. */
+/** Short label for the legend: the model, without the dated build suffix.
+ *
+ *  The vendor prefix is deliberately kept. Stripping `claude-` made sense when
+ *  every model carried it and it was pure noise; with three vendors it would
+ *  leave "sonnet-5" sitting next to "grok-4" and "gemini-2.5-flash", hiding
+ *  the one attribute the colour no longer encodes. */
 function shortName(model: string): string {
-  return model.replace(/^claude-/, "").replace(/-\d{8}$/, "");
+  return model.replace(/-\d{8}$/, "");
 }
 
 const SIZE = 168;
@@ -88,7 +105,11 @@ interface Slice {
   end: number;
 }
 
-function buildSlices(models: Overview["models"], total: number): Slice[] {
+function buildSlices(
+  models: Overview["models"],
+  total: number,
+  tiers: Record<string, number>,
+): Slice[] {
   const sorted = [...models].sort((a, b) => b.prompts - a.prompts);
 
   // Fold the tail rather than adding colours for it.
@@ -115,7 +136,7 @@ function buildSlices(models: Overview["models"], total: number): Slice[] {
     return {
       ...m,
       share,
-      color: m.model === "Other" ? OFF_LADDER : modelColor(m.model),
+      color: m.model === "Other" ? OFF_LADDER : modelColor(m.model, tiers),
       start,
       end,
     };
@@ -125,8 +146,19 @@ function buildSlices(models: Overview["models"], total: number): Slice[] {
 export function ModelMix({ data }: { data: Overview }) {
   const [hover, setHover] = useState<number | null>(null);
 
+  // Same query key as the model pickers, so this shares their cache rather
+  // than costing a request. Undefined until it lands, which colours every
+  // slice off-ladder for that instant — a neutral donut is a better first
+  // paint than one that recolours itself once prices arrive.
+  const { data: registry } = useQuery({
+    queryKey: ["providers"],
+    queryFn: api.providers,
+    staleTime: 5 * 60_000,
+  });
+  const tiers = registry?.model_tiers ?? {};
+
   const total = data.models.reduce((s, m) => s + m.prompts, 0);
-  const slices = buildSlices(data.models, total);
+  const slices = buildSlices(data.models, total, tiers);
   const active = hover === null ? null : slices[hover];
 
   if (total === 0) {

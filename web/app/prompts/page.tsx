@@ -1,5 +1,6 @@
 "use client";
 
+import { useModels } from "@/lib/use-models";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
@@ -10,7 +11,6 @@ import {
   ApiError,
   INPUT_PLACEHOLDER,
   relativeTime,
-  RUN_MODELS,
   type PromptSummary,
 } from "@/lib/api";
 
@@ -133,8 +133,11 @@ function NewPrompt({ onCancel }: { onCancel: () => void }) {
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [template, setTemplate] = useState(STARTER);
-  const [model, setModel] = useState<string>(RUN_MODELS[0]);
+  const [model, setModel] = useState("");
   const [maxTokens, setMaxTokens] = useState(1024);
+
+  const models = useModels();
+  const effectiveModel = models.includes(model) ? model : (models[0] ?? "");
 
   const create = useMutation({
     mutationFn: () =>
@@ -145,7 +148,7 @@ function NewPrompt({ onCancel }: { onCancel: () => void }) {
         // Model and max_tokens ride along with the text as the version's
         // config, so picking a version in the run form fills in a whole
         // setup rather than just words.
-        config: { model, max_tokens: maxTokens },
+        config: { model: effectiveModel, max_tokens: maxTokens },
         note: "First version.",
       }),
     onSuccess: (created) => {
@@ -217,11 +220,11 @@ function NewPrompt({ onCancel }: { onCancel: () => void }) {
             Default model
           </span>
           <select
-            value={model}
+            value={effectiveModel}
             onChange={(e) => setModel(e.target.value)}
             className={FIELD}
           >
-            {RUN_MODELS.map((m) => (
+            {models.map((m) => (
               <option key={m} value={m}>
                 {m}
               </option>
@@ -254,7 +257,7 @@ function NewPrompt({ onCancel }: { onCancel: () => void }) {
       <div className="flex items-center gap-3">
         <button
           type="submit"
-          disabled={!name.trim() || missingPlaceholder || create.isPending}
+          disabled={!name.trim() || !effectiveModel || missingPlaceholder || create.isPending}
           className="rounded-lg btn-primary px-3 py-1.5 text-xs font-medium disabled:opacity-40"
         >
           {create.isPending ? "Creating…" : "Create prompt"}

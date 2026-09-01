@@ -71,22 +71,65 @@ export interface TraceSummary {
 }
 
 /**
- * Dashboard rollup. All three totals describe the same population — gen_ai
- * `chat` spans, i.e. prompts actually sent to a model — so they divide into
- * each other correctly. `series` is always `window_hours` buckets ending at
- * the current hour, zero-filled by the backend.
+ * Every headline number for one period.
+ *
+ * Its own type because the dashboard carries two of these — the window on
+ * screen and the window before it — and a baseline built to a different shape
+ * than the number it qualifies is a bug waiting to happen. The backend shapes
+ * both through one function for the same reason.
  */
-export interface Overview {
+export interface OverviewTotals {
+  prompts: number;
+  duration_ms: number;
+  cost_usd: number;
+  /** Chat spans that came back with status ERROR. Per prompt, not per trace. */
+  errors: number;
+  /** `errors / prompts`, 0 when nothing ran. Computed server-side so the rate
+   *  and the counts behind it always describe the same window. */
+  error_rate: number;
+  /**
+   * Latency percentiles over the period's chat spans, in milliseconds.
+   *
+   * Null — not zero — when nothing ran, or when nothing recorded a duration. A
+   * p95 of 0ms would be a claim about speed that no call ever supported.
+   */
+  latency_p50_ms: number | null;
+  latency_p95_ms: number | null;
+  input_tokens: number;
+  output_tokens: number;
+}
+
+/**
+ * Dashboard rollup. All the totals describe the same population — gen_ai
+ * `chat` spans, i.e. prompts actually sent to a model — so they divide into
+ * each other correctly. `series` covers exactly `window_hours`, ending at the
+ * current bucket and zero-filled by the backend.
+ */
+export interface Overview extends OverviewTotals {
   window_hours: number;
+  /**
+   * Seconds per `series` point. Not always an hour: the backend widens the
+   * bucket with the window so the series stays 12-30 points at every range
+   * (5 minutes at 1h, a day at 30d). Everything that labels the time axis has
+   * to read this rather than assume.
+   */
+  bucket_seconds: number;
   /** The source these numbers describe; "" means every source. Echoed back by
    *  the backend so a filtered zero is distinguishable from an empty one. */
   source: string;
   /** The provider key these numbers describe; "" means every key. */
   credential: string;
-  prompts: number;
-  duration_ms: number;
-  cost_usd: number;
-  series: { hour_start: number; prompts: number }[];
+  /**
+   * The same totals over the window of equal length immediately before this
+   * one, so every tile can say which way its number is moving.
+   *
+   * Both periods are measured from the current clock rather than from the
+   * bucket grid, and are exactly the same length — the newest bucket is always
+   * partial, and comparing it against a complete one would print a fall in
+   * traffic that is only the time of day.
+   */
+  previous: OverviewTotals;
+  series: { bucket_start: number; prompts: number }[];
   /**
    * Share of prompts by model, same window and filters as the totals above,
    * so these counts sum to `prompts` exactly.
@@ -559,7 +602,7 @@ export type ScorerDraft = Omit<
   "id" | "created_at" | "score_count" | "prompt_id" | "version" | "show_in_playground"
 >;
 
-// Declared here rather than beside RUN_MODELS below: SCORER_PRESETS
+// Declared here rather than beside the model helpers below: SCORER_PRESETS
 // interpolates all three at module evaluation, and a const declared after its
 // use is a temporal-dead-zone ReferenceError rather than a hoisted undefined.
 export const INPUT_PLACEHOLDER = "{{input}}";
@@ -708,20 +751,39 @@ export interface PlaygroundResult {
   latency_ms: number;
   finish_reason: string;
   score_ids: string[];
-  /** Which key paid for this call. */
+  /** Which key paid for the *generation*. */
   credential_id: string;
   credential_name: string;
+  /**
+   * Which key(s) paid for the judging, which need not be the one above.
+   *
+   * A scorer grades with its own model, so a Claude scorer is billed to an
+   * Anthropic key even when the completion was generated on Grok. Empty when
+   * no scorers ran.
+   */
+  judged_by: string[];
   /** Non-empty when scorers were picked but there was nothing to judge. */
   scoring_skipped: string;
 }
 
-/** Models offered in the run form. Kept in step with the SDK pricing table —
- *  a model missing from that table runs fine but reports no cost. */
-export const RUN_MODELS = [
-  "claude-sonnet-5",
-  "claude-opus-5",
-  "claude-haiku-4-5",
-] as const;
+/** A provider a key can be created for. Served from the llm.py registry so
+ *  adding a provider is one backend change, not two. */
+export interface Provider {
+  name: string;
+  label: string;
+  /** Models this provider offers. The backend guarantees each one is priced. */
+  models: string[];
+  /** What this vendor's keys look like, for the paste field's placeholder. */
+  key_hint: string;
+}
+
+/** Last-resort model list, used only before /api/providers has answered.
+ *
+ *  The real list is served per provider by the backend — see `useModels`. This
+ *  exists so a select is never rendered empty on first paint, and is not a
+ *  place to add models: a model here that the backend does not offer would be
+ *  selectable and then rejected. */
+export const FALLBACK_MODELS = ["claude-sonnet-5"] as const;
 
 // --- calls ---------------------------------------------------------------
 
@@ -749,9 +811,15 @@ export const api = {
   // --- provider keys ---
   credentials: () => request<{ credentials: Credential[] }>("/api/credentials"),
 
+  providers: () =>
+    request<{ providers: Provider[]; model_tiers: Record<string, number> }>(
+      "/api/providers",
+    ),
+
   createCredential: (body: {
     name: string;
     secret: string;
+    provider?: string;
     make_default?: boolean;
   }) =>
     request<{ id: string }>("/api/credentials", {
@@ -1038,6 +1106,40 @@ export function formatDuration(ms: number): string {
 }
 
 /**
+ * One call's latency, for a headline tile.
+ *
+ * Between the other two on purpose. formatDuration spends 2dp on a single
+ * span, which is right in a waterfall and noise at display size;
+ * formatDurationLong rounds to whole seconds, which collapses the entire range
+ * an LLM p95 actually lands in (1-30s) onto a handful of values and makes a
+ * real regression invisible. This keeps one decimal where the number moves and
+ * drops it once the magnitude carries the story.
+ */
+export function formatLatency(ms: number): string {
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 10_000) return `${(ms / 1000).toFixed(1)}s`;
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`;
+  return formatDurationLong(ms);
+}
+
+/**
+ * A rate as a percentage, for the error tile.
+ *
+ * Keeps a decimal below 10% because that is where the interesting range is: a
+ * dashboard that rounds 0.4% and 1.4% both to "1%" has thrown away the
+ * difference between a nuisance and an incident. Above 10% the integer is
+ * plenty — nobody needs the decimal to know it is bad.
+ */
+export function formatRate(fraction: number): string {
+  const pct = fraction * 100;
+  if (pct === 0) return "0%";
+  // Not "0.0%", which reads as clean when it is not.
+  if (pct < 0.1) return "<0.1%";
+  if (pct < 10) return `${pct.toFixed(1)}%`;
+  return `${Math.round(pct)}%`;
+}
+
+/**
  * Coarse duration for aggregate totals.
  *
  * formatDuration is built for one span and tops out at seconds — a day's
@@ -1109,6 +1211,72 @@ export function formatCostLong(usd: number): string {
   // [0.01, 1), which formats as "0.010" through "0.99".
   if (cents >= 0.01) return `${cents.toPrecision(2)}¢`;
   return "<0.01¢";
+}
+
+/**
+ * How a metric moved against its baseline.
+ *
+ * `null` means there is nothing honest to show: a period that measured nothing
+ * (a null p95), or two zeros, which is not a 0% change but an absence of any
+ * change to report. `"new"` is the other special case — a baseline of zero
+ * makes a percentage undefined, and "up from nothing" is the real story.
+ */
+export type Change =
+  | { kind: "new" }
+  | { kind: "flat" }
+  | { kind: "move"; /** Signed. Percent, or points if `points` was set. */ value: number };
+
+/**
+ * Compare a number against the same number one window ago.
+ *
+ * `points` switches from relative change to absolute difference in percentage
+ * points, which is the only correct reading when the metric is itself a rate.
+ * An error rate going 20% → 12% is eight points down; calling that "-40%"
+ * is arithmetically true about the ratio and reliably misread as a fall of
+ * forty points.
+ *
+ * Anything that rounds away to nothing reports "flat" rather than "0%", which
+ * would imply a precision the rounding just threw out.
+ */
+export function change(
+  current: number | null,
+  previous: number | null,
+  points = false,
+): Change | null {
+  if (current === null || previous === null) return null;
+  if (previous === 0) return current === 0 ? null : { kind: "new" };
+
+  const value = points
+    ? (current - previous) * 100
+    : ((current - previous) / previous) * 100;
+
+  // Matches the display rounding below, so nothing ever renders as "0%".
+  const shown = Math.abs(value) < 10 ? +value.toFixed(1) : Math.round(value);
+  return shown === 0 ? { kind: "flat" } : { kind: "move", value };
+}
+
+/** A change, rendered. Same rounding rule as formatRate: a decimal where the
+ *  number still moves, an integer once the magnitude carries it. */
+export function formatChange(value: number, points = false): string {
+  const magnitude = Math.abs(value);
+  const digits = magnitude < 10 ? magnitude.toFixed(1) : String(Math.round(magnitude));
+  return `${digits}${points ? "pp" : "%"}`;
+}
+
+/**
+ * Token counts for a tile.
+ *
+ * Compact from a thousand up, unlike formatCountLong which holds out to a
+ * hundred thousand. A prompt count is a figure someone might reconcile against
+ * the traces list, so it stays exact for as long as it fits; a token total is
+ * a magnitude nobody counts, and it reaches seven digits in an afternoon.
+ */
+export function formatTokens(n: number): string {
+  if (n < 1000) return n.toLocaleString();
+  return new Intl.NumberFormat(undefined, {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(n);
 }
 
 /**
