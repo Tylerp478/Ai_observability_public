@@ -202,10 +202,82 @@ function Dashboard() {
         <ScoreAverages hours={range.hours} credential={credential} />
       </div>
 
+      <SpendByUser data={data} />
+
       {/* Full width and last: the rows carry long names and a link each, so
           this wants the whole measure rather than half of it. */}
       <TopTraces data={data} />
     </div>
+  );
+}
+
+/**
+ * What each person has spent, over the window the page is showing.
+ *
+ * **This does not sum to the cost tile, and should not.** Spans pushed by the
+ * SDK are the observed application's own traffic — nobody clicked Run — so
+ * they carry no user and are absent here. Presenting a subtotal as if it were
+ * the whole would be the more comfortable lie; the footnote says which calls
+ * are counted instead.
+ *
+ * Hidden entirely when nothing is attributed, rather than shown empty. Every
+ * call made before this attribution existed is unattributable and always will
+ * be, so a permanently blank table on a fresh install would read as broken
+ * rather than as new.
+ */
+function SpendByUser({ data }: { data: Overview }) {
+  const rows = data.spend_by_user ?? [];
+  if (rows.length === 0) return null;
+
+  const total = rows.reduce((sum, r) => sum + r.cost_usd, 0);
+
+  return (
+    <section className="rounded-2xl border border-neutral-800 bg-neutral-900 p-4">
+      <h2 className="text-sm font-medium">Spend by person</h2>
+      <p className="mt-0.5 text-[11px] text-neutral-500">
+        Prompts, evals and scoring run from this UI in the{" "}
+        {rangeLabel(data.window_hours).toLowerCase()}. Traffic sent by the SDK
+        has no person behind it and is not counted here.
+      </p>
+
+      <table className="table-fade mt-3 w-full text-xs">
+        <thead>
+          <tr className="text-left text-[10px] tracking-wide text-neutral-500 uppercase">
+            <th className="py-1.5 font-medium">Person</th>
+            <th className="py-1.5 text-right font-medium">Calls</th>
+            <th className="py-1.5 text-right font-medium">Cost</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.email}>
+              <td className="py-1.5 pr-3 font-mono text-[11px] break-all">
+                {r.email}
+              </td>
+              <td className="py-1.5 text-right tabular-nums text-neutral-400">
+                {r.calls.toLocaleString()}
+              </td>
+              <td className="py-1.5 text-right tabular-nums">
+                {formatCost(r.cost_usd)}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+        {rows.length > 1 && (
+          <tfoot>
+            <tr className="text-neutral-400">
+              <td className="py-1.5 pr-3">Total attributed</td>
+              <td className="py-1.5 text-right tabular-nums">
+                {rows.reduce((n, r) => n + r.calls, 0).toLocaleString()}
+              </td>
+              <td className="py-1.5 text-right tabular-nums">
+                {formatCost(total)}
+              </td>
+            </tr>
+          </tfoot>
+        )}
+      </table>
+    </section>
   );
 }
 

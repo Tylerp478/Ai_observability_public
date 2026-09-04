@@ -20,7 +20,13 @@ import { api, type Role } from "@/lib/api";
  * under-offer corrects itself on the next render, where a brief over-offer is
  * a button that fails.
  */
-export function useRole(): { role: Role; isAdmin: boolean; isLoading: boolean } {
+export function useRole(): {
+  role: Role;
+  isAdmin: boolean;
+  /** May run the Playground. Admins and devs; nobody else. */
+  canUsePlayground: boolean;
+  isLoading: boolean;
+} {
   const { data, isLoading } = useQuery({
     queryKey: ["me"],
     queryFn: api.me,
@@ -29,5 +35,14 @@ export function useRole(): { role: Role; isAdmin: boolean; isLoading: boolean } 
   });
 
   const role: Role = data?.role ?? "viewer";
-  return { role, isAdmin: role === "admin", isLoading };
+  return {
+    role,
+    isAdmin: role === "admin",
+    // Named for the capability, not the role. Every other spend surface stays
+    // on `isAdmin`, so a reader can tell at the call site which of the two
+    // questions is being asked — "are they an admin" or "may they do this
+    // one thing" — without going and looking up what `dev` currently means.
+    canUsePlayground: role === "admin" || role === "dev",
+    isLoading,
+  };
 }

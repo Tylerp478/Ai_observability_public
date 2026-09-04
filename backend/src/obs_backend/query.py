@@ -54,6 +54,12 @@ _SELECT = """
 # would fail on rather than read as null.
 _CREDENTIAL_EXPR = "json_extract_string(attributes_json, '$.\"obs.credential\"')"
 
+# Who started the call, for per-user spend. Absent on SDK-ingested spans, on
+# guardrail checks made with an ingest key, and on everything written before
+# the attribute existed — all of which are genuinely nobody, so they are
+# filtered out rather than bucketed under a blank name.
+_USER_EXPR = "json_extract_string(attributes_json, '$.\"obs.user\"')"
+
 
 # How the trace list can be ordered. A whitelist because ORDER BY cannot be
 # parameterized — the value is interpolated into the SQL, so it must never be
@@ -250,6 +256,63 @@ class TraceQuery:
         GROUP BY credential
         """
         return {r["credential"]: float(r["cost_usd"] or 0) for r in self._rows(sql)}
+
+    def spend_by_user(self, project_id: str, hours: int, source: str = "") -> list[dict[str, Any]]:
+        """Cost and call count per person over a window, dearest first.
+
+        Same span store and the same dedupe as every other aggregate here, so
+        these numbers reconcile with the tiles above them rather than being a
+        second opinion.
+
+        **Only calls a signed-in person started appear.** Spans pushed by the
+        SDK have no user and never will — they are the observed application's
+        own traffic, not somebody clicking Run — so this table is deliberately
+        not a breakdown of the total cost on the same page. It answers "who has
+        spent what through this UI", which is a smaller question and the only
+        one the data can honestly support.
+
+        Nothing before this attribute existed can be attributed, and no
+        backfill is possible: the information was never recorded. Those spans
+        are simply absent here rather than being folded into some "unknown"
+        row that would look like a person.
+        """
+        relation = self._spans_relation(project_id)
+        if relation is None:
+            return []
+
+        # Nanoseconds, matching every timestamp in the span store.
+        since = time.time_ns() - hours * 3_600 * 1_000_000_000
+
+        sql = f"""
+        WITH spans AS ({relation}),
+        deduped AS (
+            SELECT * FROM (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY span_id) AS rn
+                FROM spans
+            ) WHERE rn = 1
+        )
+        SELECT {_USER_EXPR} AS email,
+               COUNT(*) AS calls,
+               SUM(COALESCE(obs_cost_usd, 0)) AS cost_usd
+        FROM deduped
+        WHERE start_time_unix_nano >= ?
+          AND {_USER_EXPR} IS NOT NULL
+          {"AND service_name = ?" if source else ""}
+        GROUP BY email
+        ORDER BY cost_usd DESC
+        """
+        params: list[Any] = [since]
+        if source:
+            params.append(source)
+
+        return [
+            {
+                "email": r["email"],
+                "calls": int(r["calls"] or 0),
+                "cost_usd": float(r["cost_usd"] or 0),
+            }
+            for r in self._rows(sql, params)
+        ]
 
     def list_traces(
         self,

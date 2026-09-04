@@ -56,6 +56,23 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+def _actor_attribute(actor: str) -> dict[str, str]:
+    """`obs.user` for a call a person started, nothing for one they did not.
+
+    Omitted rather than written empty, so the attribute's absence means exactly
+    one thing: nobody was signed in. Spans pushed by the SDK and guardrail
+    checks made with an ingest key are machine traffic with no person behind
+    them, and every span written before this existed is in the same position —
+    an empty string would put all three in a bucket that looks like a user
+    named "".
+
+    The email, not the user id, matching `obs.credential` recording the key's
+    name: a span should stay readable without a lookup into a row that may
+    since have been deleted.
+    """
+    return {"obs.user": actor} if actor else {}
+
+
 from obs_sdk.pricing import estimate_cost_usd
 
 from obs_backend import credentials, llm, prompts
@@ -954,6 +971,7 @@ def _execute_job(
     root_name: str,
     root_attributes: dict[str, Any],
     credential_for: dict[str, Credential],
+    actor: str = "",
 ) -> None:
     """Run every (scorer, target) pair and emit one trace for the job.
 
@@ -974,7 +992,11 @@ def _execute_job(
     def work(pair: tuple[Scorer, _Target]) -> bool:
         scorer, target = pair
         credential = credential_for[scorer.id]
-        span_attributes = {**root_attributes, "obs.credential": credential.name}
+        span_attributes = {
+            **root_attributes,
+            "obs.credential": credential.name,
+            **_actor_attribute(actor),
+        }
         _write_score(target.score_id, status="running")
         span_id = _hex(8)
         meta: dict[str, Any] = {"start_nano": time.time_ns()}
@@ -1118,6 +1140,7 @@ def score_run(
     scorer_ids: list[str],
     writer: SpanWriter,
     credential: Credential,
+    actor: str = "",
 ) -> int:
     """Score every succeeded item of a run. Returns the number of judge calls.
 
@@ -1195,6 +1218,8 @@ def score_run(
             root_name=f"eval scoring {run[1] or run_id[:8]}",
             root_attributes={"obs.run_id": run_id},
             credential_for=credential_for,
+        
+            actor=actor,
         ),
         f"score-{run_id[:8]}",
     )
@@ -1212,6 +1237,7 @@ def score_span(
     writer: SpanWriter,
     credential: Credential,
     generation_credential: str = "",
+    actor: str = "",
 ) -> list[str]:
     """Score a single span from a trace. Returns the new score ids.
 
@@ -1260,6 +1286,8 @@ def score_span(
             root_name=f"span scoring {span_id}",
             root_attributes={"obs.target_trace_id": trace_id, "obs.target_span_id": span_id},
             credential_for=credential_for,
+        
+            actor=actor,
         ),
         f"score-span-{span_id[:8]}",
     )
@@ -1275,6 +1303,7 @@ def try_scorer(
     expected: str | None,
     writer: SpanWriter,
     credential: Credential,
+    actor: str = "",
 ) -> dict[str, Any]:
     """One judge call against ad-hoc text, run synchronously and not persisted.
 
@@ -1302,7 +1331,11 @@ def try_scorer(
     span_id = _hex(8)
     meta: dict[str, Any] = {"start_nano": time.time_ns()}
 
-    extra = {"obs.scorer_try": True, "obs.credential": credential.name}
+    extra = {
+        "obs.scorer_try": True,
+        "obs.credential": credential.name,
+        **_actor_attribute(actor),
+    }
 
     try:
         result, meta = judge(

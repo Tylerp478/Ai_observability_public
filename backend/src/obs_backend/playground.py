@@ -37,6 +37,23 @@ import secrets
 import time
 from typing import Any
 
+def _actor_attribute(actor: str) -> dict[str, str]:
+    """`obs.user` for a call a person started, nothing for one they did not.
+
+    Omitted rather than written empty, so the attribute's absence means exactly
+    one thing: nobody was signed in. Spans pushed by the SDK and guardrail
+    checks made with an ingest key are machine traffic with no person behind
+    them, and every span written before this existed is in the same position —
+    an empty string would put all three in a bucket that looks like a user
+    named "".
+
+    The email, not the user id, matching `obs.credential` recording the key's
+    name: a span should stay readable without a lookup into a row that may
+    since have been deleted.
+    """
+    return {"obs.user": actor} if actor else {}
+
+
 from obs_sdk.pricing import estimate_cost_usd
 
 from obs_backend import credentials, llm, scoring
@@ -77,6 +94,7 @@ def run(
     scorer_ids: list[str] | None = None,
     credential_id: str | None = None,
     writer: SpanWriter,
+    actor: str = "",
 ) -> dict[str, Any]:
     """Send one prompt, record it, and kick off scoring. Returns the result.
 
@@ -135,6 +153,7 @@ def run(
                     error=message,
                     provider=credential.provider,
                     credential_name=credential.name,
+                    actor=actor,
                 )
             ]
         )
@@ -163,6 +182,7 @@ def run(
                 cost=cost,
                 provider=credential.provider,
                 credential_name=credential.name,
+                actor=actor,
             )
         ]
     )
@@ -201,6 +221,7 @@ def run(
             # judge available.
             credential=credential,
             generation_credential=credential.name,
+            actor=actor,
         )
 
     return {
@@ -237,6 +258,7 @@ def _span(
     credential_name: str,
     cost: float | None = None,
     error: str = "",
+    actor: str = "",
 ) -> Span:
     """The completion as a gen_ai span. One span, no root — it is the root.
 
@@ -276,6 +298,7 @@ def _span(
             {
                 "obs.playground": True,
                 "obs.credential": credential_name,
+                **_actor_attribute(actor),
                 # Cached / reasoning counts, present only when non-zero.
                 **(llm.usage_attributes(call) if call else {}),
             }

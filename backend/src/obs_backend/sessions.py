@@ -39,10 +39,19 @@ RATE_LIMIT_ATTEMPTS = 5
 RATE_LIMIT_WINDOW = timedelta(minutes=15)
 
 
-#: The two roles that exist. `member` — can spend, no admin surfaces — is
-#: deliberately not here: nothing needs it yet, and a role nothing grants is a
-#: branch nothing tests.
-ROLES = ("admin", "viewer")
+#: The roles that exist, widest first.
+#:
+#: `dev` is the middle rung: everything a viewer sees, plus the Playground and
+#: nothing else. It is deliberately not "admin minus the admin pages" — the
+#: sharp edge in this app is not which pages you can open, it is that almost
+#: every interesting action spends money against a shared provider key. One
+#: Playground call is a bounded, single-prompt cost; an eval run over a dataset
+#: is not, and deleting a scorer changes what everyone else's numbers mean.
+#:
+#: There is still no per-user spend cap. A dev can run the Playground as often
+#: as they like, and the only visibility into that is the per-key spend on the
+#: Keys page. Worth knowing before handing the role out.
+ROLES = ("admin", "dev", "viewer")
 
 #: The accents a person can choose. Validated here rather than by a CHECK
 #: constraint, so adding one is a deploy and not a migration.
@@ -72,13 +81,17 @@ class SessionUser:
     def is_admin(self) -> bool:
         return self.role == "admin"
 
+    @property
+    def is_dev(self) -> bool:
+        return self.role == "dev"
+
 
 def normalize_email(email: str) -> str:
     """Lowercased and trimmed, everywhere, always.
 
     The allowlist joins on this string. If an invite is stored as
-    "Sarah@Work.com" and the login arrives as "sarah@work.com", the join misses
-    and a person who was invited is told they are not allowed in.
+    "Ada@Example.TEST" and the login arrives as "ada@example.test", the join
+    misses and a person who was invited is told they are not allowed in.
     """
     return email.strip().lower()
 

@@ -39,6 +39,23 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+def _actor_attribute(actor: str) -> dict[str, str]:
+    """`obs.user` for a call a person started, nothing for one they did not.
+
+    Omitted rather than written empty, so the attribute's absence means exactly
+    one thing: nobody was signed in. Spans pushed by the SDK and guardrail
+    checks made with an ingest key are machine traffic with no person behind
+    them, and every span written before this existed is in the same position —
+    an empty string would put all three in a bucket that looks like a user
+    named "".
+
+    The email, not the user id, matching `obs.credential` recording the key's
+    name: a span should stay readable without a lookup into a row that may
+    since have been deleted.
+    """
+    return {"obs.user": actor} if actor else {}
+
+
 from obs_sdk.pricing import estimate_cost_usd
 
 from obs_backend import credentials, llm, prompts, scoring
@@ -113,6 +130,7 @@ def create_run(
     prompt_version_id: str | None = None,
     prompt_label: str = "",
     credential_id: str | None = None,
+    actor: str = "",
 ) -> dict[str, Any]:
     """Validate, materialize the run and its items, and return the run row.
 
@@ -212,8 +230,9 @@ def create_run(
             """
             INSERT INTO runs (id, dataset_id, project_id, name, prompt_template,
                               model, max_tokens, status, item_count, trace_id, error,
-                              scorer_ids, prompt_version_id, prompt_label, credential_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s)
+                              scorer_ids, prompt_version_id, prompt_label, credential_id,
+                              created_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 run_id,
@@ -235,6 +254,7 @@ def create_run(
                 # resolution that never happened.
                 prompt_label.strip().lower() if version and prompt_label else "",
                 credential.id,
+                actor,
             ),
         )
         with conn.cursor() as cur:
@@ -313,7 +333,8 @@ def _execute(run_id: str, writer: SpanWriter) -> None:
         with get_pool().connection() as conn:
             run = conn.execute(
                 "SELECT project_id, dataset_id, name, prompt_template, model, "
-                "max_tokens, trace_id, scorer_ids, credential_id FROM runs WHERE id = %s",
+                "max_tokens, trace_id, scorer_ids, credential_id, created_by "
+                "FROM runs WHERE id = %s",
                 (run_id,),
             ).fetchone()
             if run is None:
@@ -340,6 +361,7 @@ def _execute(run_id: str, writer: SpanWriter) -> None:
             trace_id,
             scorer_ids_json,
             credential_id,
+            actor,
         ) = run
 
         # Re-resolved on the worker thread rather than carried from create_run:
@@ -367,6 +389,7 @@ def _execute(run_id: str, writer: SpanWriter) -> None:
                 model=model,
                 max_tokens=max_tokens,
                 credential=credential,
+                actor=actor,
             )
 
         with ThreadPoolExecutor(max_workers=max(1, RUN_CONCURRENCY)) as pool:
@@ -457,6 +480,7 @@ def _run_one(
     model: str,
     max_tokens: int,
     credential: Credential,
+    actor: str = "",
 ) -> Span:
     """One test case: render, call, record. Returns the span for the call."""
     prompt = render_prompt(template, item.input)
@@ -507,6 +531,7 @@ def _run_one(
                 "obs.run_id": run_id,
                 "obs.dataset_item_id": item.id,
                 "obs.credential": credential.name,
+                **_actor_attribute(actor),
             }
             ),
         )
@@ -571,6 +596,7 @@ def _run_one(
                 "obs.run_id": run_id,
                 "obs.dataset_item_id": item.id,
                 "obs.credential": credential.name,
+                **_actor_attribute(actor),
             }
         ),
     )

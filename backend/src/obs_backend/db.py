@@ -617,6 +617,18 @@ CREATE INDEX IF NOT EXISTS allowed_emails_invite_idx
 -- gain entries, and a constraint here would mean a schema migration to add a
 -- colour; the API validates against the one list that already has to exist.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS theme TEXT NOT NULL DEFAULT 'purple';
+
+-- Who started this run, for per-user spend.
+--
+-- On the row rather than carried in memory because `_execute` re-reads the run
+-- from here on its worker thread instead of closing over what created it — the
+-- same reason `credential_id` lives here. A run that survives a restart has to
+-- still know whose it was.
+--
+-- The email, not the user id, matching how a span records `obs.credential` as
+-- the key's *name*: the attribution should stay readable without a lookup into
+-- a row that may since have been deleted. Empty for runs that predate this.
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS created_by TEXT NOT NULL DEFAULT '';
 """
 
 

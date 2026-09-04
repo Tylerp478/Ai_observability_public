@@ -329,9 +329,23 @@ function ProviderKeys() {
                 </p>
                 <p className="mt-0.5 font-mono text-[11px] text-neutral-500">
                   {providerLabel(c.provider)}
-                  {" · "}···{c.last4}
-                  {" · "}
-                  {formatCost(c.spend_usd)} spent
+                  {/* Both are admin-only fields and this page is admin-only,
+                      so they are always present here. Rendered conditionally
+                      anyway: if that ever stops being true the row loses a
+                      detail, rather than printing "···undefined" or claiming
+                      a key has cost $0.00 when the number was simply not
+                      sent. */}
+                  {c.last4 && (
+                    <>
+                      {" · "}···{c.last4}
+                    </>
+                  )}
+                  {c.spend_usd !== undefined && (
+                    <>
+                      {" · "}
+                      {formatCost(c.spend_usd)} spent
+                    </>
+                  )}
                   {c.last_used_at
                     ? ` · used ${new Date(c.last_used_at).toLocaleDateString()}`
                     : " · never used"}

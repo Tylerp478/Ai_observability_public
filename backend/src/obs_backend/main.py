@@ -71,6 +71,19 @@ PUBLIC_PATHS = {
 # be a worse outcome than anything this gate prevents.
 WRITE_EXEMPT_PATHS = PUBLIC_PATHS | {"/api/auth/logout", "/api/auth/theme"}
 
+# The only writes a `dev` may make, on top of the exempt paths above.
+#
+# An explicit allowlist rather than a denylist of admin routes, so the failure
+# mode of forgetting to update it is a dev being refused something they should
+# have — visible, reported, harmless — instead of being handed a route nobody
+# considered. A new endpoint is admin-only until someone decides otherwise,
+# which is the same fail-closed property the 401 and the role gate already have.
+#
+# Note what is *not* here: saving a Playground result as a test case writes to
+# a shared dataset, and starting an eval run spends per item rather than per
+# prompt. Both are admin work by this cut.
+DEV_WRITABLE_PATHS = frozenset({"/api/playground"})
+
 _settings = get_settings()
 _storage = build_storage(_settings)
 _writer = SpanWriter(_storage)
@@ -202,13 +215,21 @@ async def default_deny(request: Request, call_next):
     ):
         user = sessions.resolve_session(request.cookies.get(SESSION_COOKIE) or "")
         if user is not None and not user.is_admin:
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "detail": "Read-only access. Ask an admin if you need to "
-                    "run, edit or spend."
-                },
-            )
+            allowed = DEV_WRITABLE_PATHS if user.is_dev else frozenset()
+            if path not in allowed:
+                # Different messages, because they are different facts. Telling
+                # a dev they have "read-only access" would be a lie they could
+                # disprove by using the Playground, and the first thing anyone
+                # does with a message they can disprove is stop believing the
+                # next one.
+                detail = (
+                    "The Playground is the only thing your account can run. "
+                    "Ask an admin for anything that edits or spends elsewhere."
+                    if user.is_dev
+                    else "Read-only access. Ask an admin if you need to run, "
+                    "edit or spend."
+                )
+                return JSONResponse(status_code=403, content={"detail": detail})
     return await call_next(request)
 
 
@@ -765,12 +786,19 @@ def get_overview(
     source: str = "",
     credential: str = "",
 ) -> dict[str, Any]:
-    return _query.overview(
+    window = _window(hours)
+    data = _query.overview(
         project_id,
-        hours=_window(hours),
+        hours=window,
         source=source or None,
         credential=credential or None,
     )
+    # Same window and the same source filter as the tiles, so the table under
+    # them describes the period the page says it does. Deliberately *not*
+    # filtered by credential: that filter asks whose money paid, and this table
+    # asks who spent it — applying both would silently answer a third question.
+    data["spend_by_user"] = _query.spend_by_user(project_id, window, source)
+    return data
 
 
 @app.get("/api/traces/{trace_id}")
@@ -950,16 +978,26 @@ def list_providers(
 @app.get("/api/credentials")
 def list_credentials(
     project_id: Annotated[str, Depends(require_session_project)],
-    user: Annotated[SessionUser, Depends(require_admin)],
+    user: Annotated[SessionUser, Depends(require_session)],
 ) -> dict[str, Any]:
-    """Provider keys, without secrets, with what each has actually cost.
+    """Provider keys, without secrets. Costs only for admins.
 
     Session-only, unlike the read API: an ingest key identifies an app sending
     spans, and that app has no business enumerating the keys this backend
-    spends on. **Admin-only within that**, because this is the one read that is
-    purely about spending: key names, their last four, and what each has cost.
-    A viewer cannot spend, so the only thing this could tell them is whose
-    money is behind the dashboard — which is administration, not observation.
+    spends on.
+
+    **The admin cut is per field, not per route** — it used to be the whole
+    route, and that was wrong in a way that only showed up once `dev` existed.
+    The model list is derived from which providers you hold a key for, so a
+    403 here did not read as "you may not see spending"; it read as "this
+    install offers exactly one model", because `useModels` falls back to a
+    single hardcoded name when it sees no credentials. A permission boundary
+    that silently rewrites a dropdown is the wrong boundary.
+
+    What the docstring said was admin-only is genuinely about money: what each
+    key has cost, and its last four. Those are stripped for everyone else. What
+    remains is which vendors this project can call and which key pays, which
+    is what anyone allowed to spend has to know in order to spend correctly.
 
     The two controls built on it degrade correctly rather than breaking: the
     credential picker and the Overview's "which key paid" filter both render
@@ -972,8 +1010,19 @@ def list_credentials(
     should stay readable without a lookup into a table row that may since have
     been archived.
     """
-    spend = _query.spend_by_credential(project_id)
     rows = credentials.list_credentials(project_id)
+    if not user.is_admin:
+        # Dropped rather than zeroed. A zero would be a claim — "this key has
+        # cost nothing" — and the client cannot tell an absent number from a
+        # true one once it is rendered as $0.00.
+        money = ("spend_usd", "run_cost_usd", "score_cost_usd", "last4")
+        return {
+            "credentials": [
+                {k: v for k, v in row.items() if k not in money} for row in rows
+            ]
+        }
+
+    spend = _query.spend_by_credential(project_id)
     for row in rows:
         row["spend_usd"] = spend.get(row["name"], 0.0)
     return {"credentials": rows}
@@ -1181,6 +1230,7 @@ def list_runs(
 @app.post("/api/runs", status_code=202)
 def create_run(
     body: CreateRunRequest,
+    project_id: Annotated[str, Depends(require_session_project)],
     user: Annotated[SessionUser, Depends(require_session)],
 ) -> dict[str, Any]:
     """Start a replay. Returns 202 with the run — results arrive by polling.
@@ -1203,6 +1253,7 @@ def create_run(
             prompt_version_id=body.prompt_version_id,
             prompt_label=body.prompt_label,
             credential_id=body.credential_id,
+            actor=user.email,
         )
     except (RunError, ScorerError, CredentialError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1236,7 +1287,7 @@ def get_run(
 
 @app.post("/api/runs/{run_id}/cancel")
 def cancel_run(
-    run_id: str, user: Annotated[SessionUser, Depends(require_session)]
+    run_id: str, project_id: Annotated[str, Depends(require_session_project)]
 ) -> dict[str, str]:
     """Stop a run in flight. Checked between items, so in-flight calls finish."""
     if not runner.cancel_run(project_id, run_id):
@@ -1388,6 +1439,7 @@ def archive_scorer(
 def try_scorer(
     scorer_id: str,
     body: TryScorerRequest,
+    project_id: Annotated[str, Depends(require_session_project)],
     user: Annotated[SessionUser, Depends(require_session)],
 ) -> dict[str, Any]:
     """One judge call against text you paste in. Synchronous, not persisted.
@@ -1405,6 +1457,7 @@ def try_scorer(
             expected=body.expected,
             writer=_writer,
             credential=credentials.resolve(project_id, body.credential_id),
+            actor=user.email,
         )
     except (ScorerError, CredentialError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1425,6 +1478,7 @@ class PlaygroundRequest(BaseModel):
 @app.post("/api/playground")
 def run_playground(
     body: PlaygroundRequest,
+    project_id: Annotated[str, Depends(require_session_project)],
     user: Annotated[SessionUser, Depends(require_session)],
 ) -> dict[str, Any]:
     """Send one prompt, keep the span, score the answer. No dataset involved.
@@ -1444,6 +1498,7 @@ def run_playground(
             scorer_ids=body.scorer_ids,
             credential_id=body.credential_id,
             writer=_writer,
+            actor=user.email,
         )
     except (PlaygroundError, ScorerError, CredentialError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1480,6 +1535,7 @@ def score_summary(
 def score_run(
     run_id: str,
     body: ScoreRequest,
+    project_id: Annotated[str, Depends(require_session_project)],
     user: Annotated[SessionUser, Depends(require_session)],
 ) -> dict[str, Any]:
     """Score a finished run. Returns immediately; the UI polls for results."""
@@ -1490,6 +1546,7 @@ def score_run(
             body.scorer_ids,
             _writer,
             credentials.resolve(project_id, body.credential_id),
+            actor=user.email,
         )
     except (ScorerError, CredentialError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1501,6 +1558,7 @@ def score_span(
     trace_id: str,
     span_id: str,
     body: ScoreRequest,
+    project_id: Annotated[str, Depends(require_session_project)],
     user: Annotated[SessionUser, Depends(require_session)],
 ) -> dict[str, Any]:
     """Score one span of a trace — the production-traffic scoring path.
@@ -1533,6 +1591,7 @@ def score_span(
             generation_credential=str(
                 (span.get("attributes") or {}).get("obs.credential", "")
             ),
+            actor=user.email,
         )
     except (ScorerError, CredentialError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

@@ -143,6 +143,14 @@ export interface Overview extends OverviewTotals {
   previous: OverviewTotals;
   series: { bucket_start: number; prompts: number }[];
   /**
+   * Cost per person over the same window, dearest first.
+   *
+   * Only calls someone started while signed in. SDK-ingested spans have no
+   * user and never will, so this does not sum to the cost tile above it —
+   * that is the honest shape of the data, not a rounding gap.
+   */
+  spend_by_user: { email: string; calls: number; cost_usd: number }[];
+  /**
    * Share of prompts by model, same window and filters as the totals above,
    * so these counts sum to `prompts` exactly.
    *
@@ -217,7 +225,7 @@ export interface Source {
 /** What someone may do. `viewer` reads everything and writes nothing; `admin`
  *  does everything. A third role — spend, but no admin surfaces — is deferred
  *  until someone needs it. */
-export type Role = "admin" | "viewer";
+export type Role = "admin" | "dev" | "viewer";
 
 /**
  * A row on the allowlist, which is not the same thing as a user.
@@ -266,12 +274,13 @@ export interface Credential {
   id: string;
   name: string;
   provider: string;
-  last4: string;
+  /** Admin-only; absent for everyone else, along with the cost fields. */
+  last4?: string;
   is_default: boolean;
   created_at: string | null;
   last_used_at: string | null;
-  run_cost_usd: number;
-  score_cost_usd: number;
+  run_cost_usd?: number;
+  score_cost_usd?: number;
   /**
    * Everything this key has cost, from the span store.
    *
@@ -279,7 +288,9 @@ export interface Credential {
    * about eval spend, so a Playground or guardrail call is invisible to them.
    * Every billable call writes a span, so this is the figure that is true.
    */
-  spend_usd: number;
+  /** Everything this key has cost. Admin-only — absent, not zero, for others,
+   *  because a zero would be a claim rather than a redaction. */
+  spend_usd?: number;
 }
 
 export interface Span {

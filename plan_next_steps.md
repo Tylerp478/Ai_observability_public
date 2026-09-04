@@ -1331,7 +1331,7 @@ defined by `.env`, so change it there.
 
   - invite → accept → signed in, with the token refused on replay and a
     password under 12 characters refused before an account exists;
-  - `Viewer.Test@Example.COM` invited, `viewer.test@example.com` stored and
+  - `Ada@Example.TEST` invited, `ada@example.test` stored and
     matched at login — the allowlist join is on a normalized address, so a
     capitalised invite does not lock out the person it was sent to;
   - a viewer reads Overview, Traces, Datasets, Scorers, Prompts, Guardrails and

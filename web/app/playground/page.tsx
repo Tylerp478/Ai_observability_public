@@ -50,7 +50,7 @@ function Playground() {
   const [maxTokens, setMaxTokens] = useState(1024);
   const [scorerIds, setScorerIds] = useState<string[]>([]);
   const [credentialId, setCredentialId] = useState("");
-  const { isAdmin } = useRole();
+  const { canUsePlayground } = useRole();
   const [result, setResult] = useState<PlaygroundResult | null>(null);
 
   // Only the models the selected key can actually serve. Derived rather than
@@ -201,9 +201,13 @@ function Playground() {
           <button
             onClick={() => send.mutate()}
             disabled={
-              !isAdmin || !prompt.trim() || !effectiveModel || send.isPending
+              !canUsePlayground || !prompt.trim() || !effectiveModel || send.isPending
             }
-            title={isAdmin ? undefined : "Read-only access — running a prompt spends money"}
+            title={
+              canUsePlayground
+                ? undefined
+                : "Read-only access — running a prompt spends money"
+            }
             className="rounded-lg btn-primary px-3 py-1.5 text-xs font-medium disabled:opacity-40"
           >
             {send.isPending ? "Running…" : "Run"}
@@ -342,6 +346,11 @@ function ScoreRow({ score }: { score: Score }) {
  * answerable by looking rather than by remembering.
  */
 function SaveAsTestCase({ result }: { result: PlaygroundResult }) {
+  // Saving writes to a shared dataset, which is outside what a dev may do —
+  // the Playground is theirs, everyone else's eval data is not. Hidden rather
+  // than disabled: a disabled control invites you to work out how to enable
+  // it, and there is nothing to work out.
+  const { isAdmin } = useRole();
   const [open, setOpen] = useState(false);
   const [datasetId, setDatasetId] = useState("");
 
@@ -360,6 +369,8 @@ function SaveAsTestCase({ result }: { result: PlaygroundResult }) {
         source_span_id: result.span_id,
       }),
   });
+
+  if (!isAdmin) return null;
 
   if (!open) {
     return (

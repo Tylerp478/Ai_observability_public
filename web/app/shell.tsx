@@ -188,9 +188,24 @@ export function Shell({ children }: { children: React.ReactNode }) {
             a time. */}
         {data && !isAdmin && (
           <p className="mb-4 rounded-xl border border-neutral-800 bg-neutral-900/40 px-3.5 py-2.5 text-xs text-neutral-400">
-            <span className="font-medium text-neutral-200">Read-only access.</span>{" "}
-            You can see everything here. Running, editing and anything that
-            spends money are an admin&apos;s to do.
+            {data.role === "dev" ? (
+              <>
+                <span className="font-medium text-neutral-200">
+                  Playground access.
+                </span>{" "}
+                You can see everything here and run prompts in the Playground.
+                Eval runs, editing and anything that changes shared settings are
+                an admin&apos;s to do.
+              </>
+            ) : (
+              <>
+                <span className="font-medium text-neutral-200">
+                  Read-only access.
+                </span>{" "}
+                You can see everything here. Running, editing and anything that
+                spends money are an admin&apos;s to do.
+              </>
+            )}
           </p>
         )}
         {children}
