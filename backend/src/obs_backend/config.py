@@ -80,6 +80,22 @@ class Settings(BaseSettings):
     # is why the localhost default survives a live deployment unchanged.
     cors_origins: str = Field(default="http://localhost:3000", alias="OBS_CORS_ORIGINS")
 
+    # The origin invite and password-reset links are built from.
+    #
+    # Empty means "whatever origin the admin happens to be browsing", which is
+    # right on a deployed box and quietly wrong on a laptop: an invite created
+    # at http://localhost:3000 carries that hostname to whoever you send it to,
+    # where it resolves to *their* machine and fails. Set this to the address
+    # other people actually reach this app on.
+    #
+    # It cannot conjure reachability. A link is only as reachable as the server
+    # — a LAN address works for people on the same network and nowhere else.
+    public_url: str = Field(default="", alias="OBS_PUBLIC_URL")
+
+    @property
+    def invite_origin(self) -> str:
+        return self.public_url.strip().rstrip("/")
+
     # Bind address. The weak-password guard keys off this.
     host: str = Field(default="127.0.0.1", alias="OBS_HOST")
     allow_weak_password: bool = Field(default=False, alias="OBS_ALLOW_WEAK_PASSWORD")

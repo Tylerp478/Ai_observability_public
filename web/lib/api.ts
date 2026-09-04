@@ -857,7 +857,17 @@ export const api = {
   logout: () => request<{ status: string }>("/api/auth/logout", { method: "POST" }),
 
   me: () =>
-    request<{ email: string; user_id: string; role: Role }>("/api/auth/me"),
+    request<{ email: string; user_id: string; role: Role; theme: string }>(
+      "/api/auth/me",
+    ),
+
+  /** Change your own accent. Allowed for viewers — it changes nothing anyone
+   *  else can see. */
+  setTheme: (theme: string) =>
+    request<{ theme: string }>("/api/auth/theme", {
+      method: "PATCH",
+      body: JSON.stringify({ theme }),
+    }),
 
   sources: () => request<{ sources: Source[] }>("/api/sources"),
 
@@ -879,7 +889,7 @@ export const api = {
   /** Returns the invite token exactly once — there is no way to read it back,
    *  by design, the same as an ingest key. */
   invitePerson: (body: { email: string; name: string; role: Role; note: string }) =>
-    request<{ email: string; token: string }>("/api/people", {
+    request<{ email: string; token: string; link?: string }>("/api/people", {
       method: "POST",
       body: JSON.stringify(body),
     }),
@@ -893,9 +903,17 @@ export const api = {
   /** A single-use link to set a new password. Returned once, like an invite —
    *  the backend stores only its hash. */
   resetPersonPassword: (email: string) =>
-    request<{ email: string; token: string }>(
+    request<{ email: string; token: string; link?: string }>(
       `/api/people/${encodeURIComponent(email)}/reset`,
       { method: "POST" },
+    ),
+
+  /** Remove someone outright — allowlist row and account. Irreversible, and
+   *  distinct from revoking, which keeps the row. */
+  deletePerson: (email: string) =>
+    request<{ status: string }>(
+      `/api/people/${encodeURIComponent(email)}/permanent`,
+      { method: "DELETE" },
     ),
 
   revokePerson: (email: string) =>

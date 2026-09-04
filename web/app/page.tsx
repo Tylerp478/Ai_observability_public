@@ -542,7 +542,7 @@ function PromptsChart({ data }: { data: Overview }) {
                 x2={W - PAD.right}
                 y1={y(t)}
                 y2={y(t)}
-                stroke="#3f424d"
+                stroke="var(--color-neutral-800)"
                 strokeWidth="1"
               />
               <text
@@ -593,7 +593,7 @@ function PromptsChart({ data }: { data: Overview }) {
             cy={y(last.prompts)}
             r="4"
             fill="var(--color-accent)"
-            stroke="#232532"
+            stroke="var(--color-neutral-900)"
             strokeWidth="2"
           />
 
@@ -604,7 +604,7 @@ function PromptsChart({ data }: { data: Overview }) {
                 x2={x(hover)}
                 y1={PAD.top}
                 y2={PAD.top + PLOT_H}
-                stroke="#595d6c"
+                stroke="var(--color-neutral-700)"
                 strokeWidth="1"
               />
               <circle
@@ -612,7 +612,7 @@ function PromptsChart({ data }: { data: Overview }) {
                 cy={y(active.prompts)}
                 r="4.5"
                 fill="var(--color-accent)"
-                stroke="#232532"
+                stroke="var(--color-neutral-900)"
                 strokeWidth="2"
               />
             </g>

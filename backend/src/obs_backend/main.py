@@ -16,6 +16,7 @@ from __future__ import annotations
 import threading
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
+from urllib.parse import quote
 
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -68,7 +69,7 @@ PUBLIC_PATHS = {
 # Writes a viewer must still be able to make. Exactly one: signing out is not
 # a privilege, and a read-only user trapped in a session they cannot end would
 # be a worse outcome than anything this gate prevents.
-WRITE_EXEMPT_PATHS = PUBLIC_PATHS | {"/api/auth/logout"}
+WRITE_EXEMPT_PATHS = PUBLIC_PATHS | {"/api/auth/logout", "/api/auth/theme"}
 
 _settings = get_settings()
 _storage = build_storage(_settings)
@@ -350,6 +351,35 @@ class LoginRequest(BaseModel):
     password: str
 
 
+THEME_COOKIE = "obs_theme"
+
+
+def _set_theme_cookie(response: Response, theme: str) -> None:
+    """Publish the chosen accent where the *server* renderer can see it.
+
+    Deliberately readable by JavaScript, unlike the session cookie: it is a
+    colour, not a credential, and the entire point is that something other than
+    this backend can read it.
+
+    It exists so the HTML arrives already wearing the right theme. The
+    alternative — a blocking inline script that rewrites the attribute before
+    first paint — does work, but it makes the server's markup knowingly wrong
+    and then corrects it, which costs a hydration mismatch on every load and a
+    React warning for rendering a <script> inside a component. Sending the
+    answer along with the document removes the problem instead of suppressing
+    the symptoms.
+    """
+    response.set_cookie(
+        key=THEME_COOKIE,
+        value=theme,
+        httponly=False,
+        secure=_settings.cookie_secure,
+        samesite=_settings.cookie_samesite,  # type: ignore[arg-type]
+        max_age=int(sessions.SESSION_TTL.total_seconds()),
+        path="/",
+    )
+
+
 def _set_session_cookie(response: Response, token: str) -> None:
     """The one place the session cookie's flags are written.
 
@@ -391,6 +421,7 @@ def login(body: LoginRequest, request: Request, response: Response) -> dict[str,
         user.user_id, user_agent=request.headers.get("user-agent", "")
     )
     _set_session_cookie(response, token)
+    _set_theme_cookie(response, user.theme)
     return {"email": user.email, "role": user.role}
 
 
@@ -417,7 +448,36 @@ def whoami(user: Annotated[SessionUser, Depends(require_session)]) -> dict[str, 
     It is not what enforces anything — a hidden button is not security, and the
     middleware refuses the write regardless of what the client rendered.
     """
-    return {"email": user.email, "user_id": user.user_id, "role": user.role}
+    return {
+        "email": user.email,
+        "user_id": user.user_id,
+        "role": user.role,
+        "theme": user.theme,
+    }
+
+
+class ThemeRequest(BaseModel):
+    theme: str
+
+
+@app.patch("/api/auth/theme")
+def set_theme(
+    body: ThemeRequest,
+    response: Response,
+    user: Annotated[SessionUser, Depends(require_session)],
+) -> dict[str, str]:
+    """Change your own accent. Yours only — there is no user id in this route.
+
+    Exempt from the viewer write-gate (see WRITE_EXEMPT_PATHS): it changes
+    nothing anyone else can see, and read-only should not extend to how the app
+    looks to you.
+    """
+    try:
+        theme = sessions.set_theme(user.user_id, body.theme)
+    except sessions.AccessError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _set_theme_cookie(response, theme)
+    return {"theme": theme}
 
 
 class InviteRequest(BaseModel):
@@ -464,6 +524,7 @@ def accept_invite(body: AcceptRequest, request: Request, response: Response) -> 
         user.user_id, user_agent=request.headers.get("user-agent", "")
     )
     _set_session_cookie(response, token)
+    _set_theme_cookie(response, user.theme)
     return {"email": user.email, "role": user.role}
 
 
@@ -491,7 +552,7 @@ def invite_person(
         )
     except sessions.AccessError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"email": sessions.normalize_email(body.email), "token": token}
+    return _link_response(sessions.normalize_email(body.email), token)
 
 
 @app.patch("/api/people/{email}")
@@ -521,7 +582,29 @@ def reset_person_password(
         token = sessions.issue_reset(email)
     except sessions.AccessError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"email": sessions.normalize_email(email), "token": token}
+    return _link_response(sessions.normalize_email(email), token)
+
+
+def _link_response(email: str, token: str) -> dict[str, str]:
+    """The token, plus the finished link when this install knows its own URL.
+
+    Without OBS_PUBLIC_URL the client builds the link from the origin it is
+    being used at. That is right far more often than it is wrong — it needs no
+    configuration and it is correct through a tunnel or on a deployed host —
+    but it fails in exactly one case, which is the common one on a laptop:
+    an admin browsing localhost mints a link that says localhost, which on the
+    recipient's machine points at the recipient's machine.
+
+    Setting the variable moves the decision from "wherever the admin happened
+    to be" to "where this app actually lives", which is a fact only the
+    operator knows.
+    """
+    payload = {"email": email, "token": token}
+    if _settings.invite_origin:
+        payload["link"] = (
+            f"{_settings.invite_origin}/accept?token={quote(token, safe='')}"
+        )
+    return payload
 
 
 @app.delete("/api/people/{email}")
@@ -535,6 +618,25 @@ def revoke_person(
     except sessions.AccessError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"status": "revoked"}
+
+
+@app.delete("/api/people/{email}/permanent")
+def delete_person(
+    email: str, user: Annotated[SessionUser, Depends(require_admin)]
+) -> dict[str, str]:
+    """Delete someone outright, rather than revoking them.
+
+    Admin-only twice over: the write middleware already refuses every non-GET
+    from a viewer, and `require_admin` states it on the route so the OpenAPI
+    spec says so too and a future change to the middleware cannot quietly open
+    it.
+    """
+    _guard_seeded_admin(email, "delete")
+    try:
+        sessions.delete_person(email, user.user_id)
+    except sessions.AccessError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "deleted"}
 
 
 def _guard_seeded_admin(email: str, action: str) -> None:

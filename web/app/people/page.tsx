@@ -17,6 +17,81 @@ export default function PeoplePage() {
 }
 
 /**
+ * Copy text, on the origins this app is actually reached at.
+ *
+ * `navigator.clipboard` exists only in a **secure context** — HTTPS, or
+ * localhost as a special case. Served over plain HTTP on a LAN address, which
+ * is exactly how you reach this from a phone, it is `undefined`; the first
+ * version dereferenced it immediately, so the button threw and did nothing at
+ * all on the one origin invite links are meant to be created from.
+ *
+ * `execCommand("copy")` is deprecated and is still the only thing that works
+ * there, so it is the fallback rather than the primary.
+ *
+ * Returns whether it actually worked, which is the other half of the fix: the
+ * old handler ignored the promise and flipped the label to "Copied"
+ * regardless, so a refused clipboard permission looked like success and you
+ * pasted whatever you had before.
+ */
+async function copyToClipboard(text: string): Promise<boolean> {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Permission refused, or the document was not focused. Fall through.
+    }
+  }
+  try {
+    const el = document.createElement("textarea");
+    el.value = text;
+    el.setAttribute("readonly", "");
+    // Off-screen but still rendered: execCommand copies the *selection*, and
+    // there is nothing to select in an element that was never laid out.
+    el.style.position = "fixed";
+    el.style.top = "-1000px";
+    document.body.appendChild(el);
+    el.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(el);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Select the whole link, so the manual path is one gesture on a phone. */
+function selectAllIn(el: HTMLElement): void {
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  const selection = window.getSelection();
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+}
+
+/** The host part of a link, for saying plainly what it points at. */
+function hostOf(link: string): string {
+  try {
+    return new URL(link).hostname;
+  } catch {
+    return link;
+  }
+}
+
+/**
+ * Whether this link only resolves on the machine that made it.
+ *
+ * Loopback names are the whole check. A LAN address is deliberately *not*
+ * flagged: it genuinely works for anyone on the same network, and crying wolf
+ * about a link that is about to work is how a warning gets ignored when it
+ * matters.
+ */
+function isLocalOnly(link: string): boolean {
+  const host = hostOf(link);
+  return host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+}
+
+/**
  * Who can sign in, and what they can do once they have.
  *
  * Its own page, not a section on Keys. Everything on that page is a
@@ -26,12 +101,17 @@ export default function PeoplePage() {
  * revoke behind a collapsed section on a page about API keys makes the fastest
  * thing you might ever need to do the hardest to find.
  *
- * **The invite link is built from `window.location.origin`.** No hostname is
- * configured anywhere in this app, and the URL you are reading this on is the
- * one URL known to reach it — so the link is correct on localhost, on a
- * tunnel, and on a deployed box, without any of them being written down. That
- * is also why there is no email: delivering the link is your job, over
- * whatever channel you already use.
+ * **Where the link's address comes from.** The backend builds it when
+ * `OBS_PUBLIC_URL` is set, because only the operator knows where this install
+ * actually lives. Otherwise it falls back to the origin you are browsing,
+ * which needs no configuration and is right through a tunnel or on a deployed
+ * host — but is wrong in the one case that bites on a laptop: a link minted at
+ * localhost says localhost, and on the recipient's machine that is *their*
+ * machine. The banner says so rather than letting you find out from someone
+ * else's confusion.
+ *
+ * No email either way: delivering the link is your job, over whatever channel
+ * you already use.
  */
 function People() {
   const qc = useQueryClient();
@@ -40,7 +120,7 @@ function People() {
   const [role, setRole] = useState<Role>("viewer");
   const [note, setNote] = useState("");
   const [fresh, setFresh] = useState<{ email: string; link: string } | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
 
   const { data, isLoading } = useQuery({ queryKey: ["people"], queryFn: api.people });
 
@@ -49,7 +129,9 @@ function People() {
     onSuccess: (res) => {
       setFresh({
         email: res.email,
-        link: `${window.location.origin}/accept?token=${encodeURIComponent(res.token)}`,
+        link:
+          res.link ??
+          `${window.location.origin}/accept?token=${encodeURIComponent(res.token)}`,
       });
       setEmail("");
       setName("");
@@ -68,12 +150,26 @@ function People() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["people"] }),
   });
 
+  // Which row is mid-confirmation. One at a time: arming every Delete button
+  // at once would let a second click land on the wrong person.
+  const [confirming, setConfirming] = useState<string | null>(null);
+
+  const remove = useMutation({
+    mutationFn: (e: string) => api.deletePerson(e),
+    onSuccess: () => {
+      setConfirming(null);
+      qc.invalidateQueries({ queryKey: ["people"] });
+    },
+  });
+
   const reset = useMutation({
     mutationFn: (e: string) => api.resetPersonPassword(e),
     onSuccess: (res) => {
       setFresh({
         email: res.email,
-        link: `${window.location.origin}/accept?token=${encodeURIComponent(res.token)}`,
+        link:
+          res.link ??
+          `${window.location.origin}/accept?token=${encodeURIComponent(res.token)}`,
       });
       qc.invalidateQueries({ queryKey: ["people"] });
     },
@@ -111,19 +207,32 @@ function People() {
           <p className="text-xs font-medium text-amber-200">
             Send this to {fresh.email} — it will not be shown again
           </p>
-          <code className="mt-2 block overflow-x-auto rounded-lg bg-neutral-950 px-3 py-2 font-mono text-[11px] break-all text-amber-100">
+          {isLocalOnly(fresh.link) && (
+            <p className="mt-1.5 text-[11px] text-amber-300/80">
+              This link points at{" "}
+              <span className="font-mono">{hostOf(fresh.link)}</span>, which on
+              anyone else&apos;s device means <em>their</em> device — it will
+              not reach this app. Send it only to someone using this machine,
+              or set <span className="font-mono">OBS_PUBLIC_URL</span> to the
+              address others reach this app on and create the link again.
+            </p>
+          )}
+          <code
+            onClick={(e) => selectAllIn(e.currentTarget)}
+            className="mt-2 block cursor-text overflow-x-auto rounded-lg bg-neutral-950 px-3 py-2 font-mono text-[11px] break-all text-amber-100"
+          >
             {fresh.link}
           </code>
           <div className="mt-2 flex gap-2">
             <button
-              onClick={() => {
-                navigator.clipboard.writeText(fresh.link);
-                setCopied(true);
-                setTimeout(() => setCopied(false), 1500);
+              onClick={async () => {
+                const ok = await copyToClipboard(fresh.link);
+                setCopyState(ok ? "copied" : "failed");
+                window.setTimeout(() => setCopyState("idle"), ok ? 1500 : 6000);
               }}
               className="rounded-lg bg-amber-200 px-2.5 py-1 text-xs font-medium text-amber-950"
             >
-              {copied ? "Copied" : "Copy link"}
+              {copyState === "copied" ? "Copied" : "Copy link"}
             </button>
             <button
               onClick={() => setFresh(null)}
@@ -132,6 +241,12 @@ function People() {
               Dismiss
             </button>
           </div>
+          {copyState === "failed" && (
+            <p className="mt-1.5 text-[11px] text-amber-300/80">
+              This browser would not let the page write to the clipboard. Tap
+              the link above to select it, then copy by hand.
+            </p>
+          )}
           <p className="mt-2 text-[11px] text-amber-300/70">
             Usable once, expires in 7 days.
           </p>
@@ -158,8 +273,13 @@ function People() {
                   >
                     {s.label}
                   </span>
-                  {!p.revoked_at && (
-                    <div className="ml-auto flex shrink-0 gap-2">
+                  {/* The cluster always renders; only the controls that act
+                      on live access are gated. Delete is the one thing a
+                      revoked row still needs — it is the row you are most
+                      likely to want gone. */}
+                  <div className="ml-auto flex shrink-0 gap-2">
+                    {!p.revoked_at && (
+                      <>
                       <select
                         value={p.role}
                         onChange={(e) =>
@@ -189,8 +309,38 @@ function People() {
                       >
                         Revoke
                       </button>
-                    </div>
-                  )}
+                      </>
+                    )}
+                      {/* Two clicks, not a confirm() dialog: this deletes the
+                          account and cannot be undone, and the second click
+                          says what it will do rather than asking "are you
+                          sure" about something the button label already
+                          claimed. */}
+                      {confirming === p.email ? (
+                        <>
+                          <button
+                            onClick={() => remove.mutate(p.email)}
+                            disabled={remove.isPending}
+                            className="rounded-lg border border-red-700 bg-red-950/40 px-2.5 py-1 text-[11px] text-red-300 disabled:opacity-40"
+                          >
+                            {remove.isPending ? "Deleting…" : "Delete forever"}
+                          </button>
+                          <button
+                            onClick={() => setConfirming(null)}
+                            className="px-1.5 py-1 text-[11px] text-neutral-500 hover:text-neutral-300"
+                          >
+                            Cancel
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          onClick={() => setConfirming(p.email)}
+                          className="rounded-lg border border-neutral-700 px-2.5 py-1 text-[11px] text-neutral-400 hover:text-red-300"
+                        >
+                          Delete
+                        </button>
+                      )}
+                  </div>
                 </div>
                 <p className="mt-1 font-mono text-[11px] text-neutral-500">
                   {p.email}
@@ -210,10 +360,13 @@ function People() {
         </ul>
       )}
 
-      {(changeRole.isError || revoke.isError || reset.isError) && (
+      {(changeRole.isError || revoke.isError || reset.isError || remove.isError) && (
         <p className="text-xs text-red-400">
-          {(changeRole.error ?? revoke.error ?? reset.error) instanceof ApiError
-            ? ((changeRole.error ?? revoke.error ?? reset.error) as ApiError).message
+          {(changeRole.error ?? revoke.error ?? reset.error ?? remove.error) instanceof
+          ApiError
+            ? (
+                (changeRole.error ?? revoke.error ?? reset.error ?? remove.error) as ApiError
+              ).message
             : "That change did not go through."}
         </p>
       )}

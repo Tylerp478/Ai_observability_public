@@ -44,6 +44,10 @@ RATE_LIMIT_WINDOW = timedelta(minutes=15)
 #: branch nothing tests.
 ROLES = ("admin", "viewer")
 
+#: The accents a person can choose. Validated here rather than by a CHECK
+#: constraint, so adding one is a deploy and not a migration.
+THEMES = ("purple", "blue", "green", "red", "orange", "yellow", "black")
+
 #: How long an unaccepted invite stays usable. Long enough to survive a
 #: weekend, short enough that a link left in a chat log stops working.
 INVITE_TTL = timedelta(days=7)
@@ -60,6 +64,9 @@ class SessionUser:
     #: Read from `allowed_emails` on every request, never cached on the user
     #: row — see the schema note. "viewer" is the floor, never an escalation.
     role: str = "viewer"
+    #: This person's accent. Travels on the session so it arrives with the
+    #: identity, rather than costing a second round trip on every page.
+    theme: str = "purple"
 
     @property
     def is_admin(self) -> bool:
@@ -248,7 +255,7 @@ def resolve_session(token: str) -> SessionUser | None:
         row = conn.execute(
             """
             SELECT s.user_id, u.email, s.expires_at, s.last_seen_at,
-                   a.role, a.revoked_at
+                   a.role, a.revoked_at, u.theme
             FROM sessions s
             JOIN users u ON u.id = s.user_id
             LEFT JOIN allowed_emails a ON a.email = u.email
@@ -283,7 +290,9 @@ def resolve_session(token: str) -> SessionUser | None:
                 "WHERE token_hash = %s",
                 (now + SESSION_TTL, now, token_hash),
             )
-        return SessionUser(user_id=user_id, email=email, role=str(role))
+        return SessionUser(
+            user_id=user_id, email=email, role=str(role), theme=str(row[6])
+        )
 
 
 def destroy_session(token: str) -> None:
@@ -565,3 +574,81 @@ def issue_reset(email: str) -> str:
             (_hash_token(token), expires, email),
         )
     return token
+
+
+def set_theme(user_id: str, theme: str) -> str:
+    """Change one person's accent.
+
+    Not an admin action and not gated like one: it changes nothing anybody else
+    can see, which is why the write middleware exempts it. A viewer picking a
+    colour is not a privileged write, and refusing it would make "read-only"
+    mean "cannot even choose how this looks to you".
+    """
+    if theme not in THEMES:
+        raise AccessError(f"Unknown theme. Choose one of: {', '.join(THEMES)}")
+    with get_pool().connection() as conn:
+        updated = conn.execute(
+            "UPDATE users SET theme = %s, updated_at = now() WHERE id = %s",
+            (theme, user_id),
+        ).rowcount
+    if not updated:
+        raise AccessError("No such user")
+    return theme
+
+
+def delete_person(email: str, actor_user_id: str) -> None:
+    """Remove someone completely — the allowlist row and the account behind it.
+
+    Deliberately not what `revoke` does. Revoke is a soft delete that keeps the
+    row so the removal is auditable and the note explaining who they were
+    survives; it is the right answer for a real person who should no longer
+    have access. This is the right answer for an entry that should never have
+    been history at all — a test invite, a typo'd address — and it is
+    irreversible.
+
+    The database does the rest of the cleanup: deleting the `users` row takes
+    their sessions with it (ON DELETE CASCADE) and blanks `added_by` on anyone
+    they invited (ON DELETE SET NULL), so nothing is left pointing at a row
+    that no longer exists.
+    """
+    email = normalize_email(email)
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT role, revoked_at FROM allowed_emails WHERE email = %s", (email,)
+        ).fetchone()
+        if row is None:
+            raise AccessError("No such person")
+
+        user = conn.execute(
+            "SELECT id FROM users WHERE email = %s", (email,)
+        ).fetchone()
+
+        # Deleting the account you are signed in as would revoke your own
+        # session mid-request and hand you a 401 with no way back in. Refusing
+        # is not paternalism: there is no version of this that ends well, and
+        # another admin can always do it for you.
+        if user is not None and str(user[0]) == actor_user_id:
+            raise AccessError("You cannot delete the account you are signed in as")
+
+        # The allowlist is checked on every request, so removing the last admin
+        # who can actually sign in locks *everyone* out of the page that would
+        # fix it. The .env bootstrap could recover it, but only by being put
+        # back and the app restarted — a worse afternoon than this message.
+        if row[0] == "admin" and row[1] is None:
+            remaining = conn.execute(
+                """
+                SELECT COUNT(*) FROM allowed_emails a
+                JOIN users u ON u.email = a.email
+                WHERE a.role = 'admin' AND a.revoked_at IS NULL
+                  AND a.accepted_at IS NOT NULL AND a.email <> %s
+                """,
+                (email,),
+            ).fetchone()[0]
+            if not remaining:
+                raise AccessError(
+                    "That is the only admin who can sign in. Make someone else "
+                    "an admin first."
+                )
+
+        conn.execute("DELETE FROM users WHERE email = %s", (email,))
+        conn.execute("DELETE FROM allowed_emails WHERE email = %s", (email,))

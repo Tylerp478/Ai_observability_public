@@ -119,6 +119,336 @@
   --color-emerald-950: #101a1f;
 }
 
+
+/* ── Themes ────────────────────────────────────────────────────────────────
+   One accent per user, applied by `data-theme` on <html>.
+
+   Each block is the same Nocturne system re-derived at a different hue, not a
+   hand-picked palette.
+
+   **Holding lightness constant across hues does not work**, which is how the
+   first attempt at this failed: a hue only reads as its own name near a
+   particular lightness. Yellow is most itself around L=0.91 and orange around
+   L=0.75, so pinning both to purple's L=0.66 produced olive and brown — colours
+   that were *correct* by construction and wrong by the only test that matters,
+   which is whether they look like the word. Each theme therefore carries a
+   lightness lift, applied as a monotone remap through (0,0), (anchor+lift) and
+   (1,1) rather than as a flat addition: a flat shift pushes the light end into
+   the ceiling, where adjacent steps clamp to the same value and the ramp
+   silently loses a step.
+
+   Chroma is expressed as the *fraction* of what sRGB actually offers at each
+   step's hue and lightness, because the absolute number means something
+   different per hue. That alone runs away — purple's 400 sits near purple's own
+   limit, and the same fraction of green's much larger limit came out neon — so
+   a second bound caps any step at 1.4x its original chroma. The tighter of the
+   two wins, which is what lets a theme be more vivid than purple without
+   becoming a different design.
+
+   The neutrals shift too, 13° cooler than the accent, exactly as Nocturne's
+   indigo-tinted greys sit against its blurple — a warm accent on cold greys
+   reads as a mistake. Their tint is damped to 45%, though, because warm hues
+   look far more saturated than cool ones at the same chroma in shadow: at
+   full strength the orange theme's page ground came out brown rather than
+   dark. The accent ramps keep their chroma; they are the part meant to
+   carry the colour.
+
+   **Status colours are deliberately absent.** Red, amber and emerald mean
+   pass, warn and fail, and a theme that re-hued them would make an error
+   message green. They stay fixed in @theme for every theme.
+
+   `purple` is the default and is written out verbatim rather than regenerated:
+   re-deriving it would move every value by a rounding step and quietly
+   restyle the app for everyone who never chose a theme.
+
+   `black` is the same system with chroma zeroed — true greys, no tint — with
+   the interactive colour lifted to near-white so an outlined button still
+   reads against the ground.
+
+   Selectors are `html[data-theme=…]` rather than `[data-theme=…]` so they beat
+   `:root` on specificity regardless of where Tailwind emits its @theme block.
+   ────────────────────────────────────────────────────────────────────────── */
+
+html[data-theme="purple"] {
+  --color-bg: #161826;
+  --color-surface: #232532;
+  --color-text: #e9e9ed;
+  --color-accent: #9184d9;
+  --color-accent-2: #a7a1db;
+
+  --color-neutral-50: #f9fafe;
+  --color-neutral-100: #f3f5fe;
+  --color-neutral-200: #e4e7f5;
+  --color-neutral-300: #cfd3e5;
+  --color-neutral-400: #b2b6ca;
+  --color-neutral-500: #9397ab;
+  --color-neutral-600: #75798c;
+  --color-neutral-700: #595d6c;
+  --color-neutral-800: #3f424d;
+  --color-neutral-850: #292b31;
+  --color-neutral-900: #232532;
+  --color-neutral-950: #161826;
+
+  --color-sky-50: #faf9ff;
+  --color-sky-100: #f5f4ff;
+  --color-sky-200: #e7e5fe;
+  --color-sky-300: #d2cefd;
+  --color-sky-400: #b5abfc;
+  --color-sky-500: #968ae0;
+  --color-sky-600: #796cbf;
+  --color-sky-700: #5d5294;
+  --color-sky-800: #423a6a;
+  --color-sky-850: #383158;
+  --color-sky-900: #2b2741;
+  --color-sky-950: #212034;
+
+  --color-violet-300: #d2cefd;
+  --color-violet-400: #c1bbe9;
+  --color-violet-500: #a7a1db;
+  --color-violet-600: #8981b9;
+  --color-violet-900: #2b293a;
+}
+
+html[data-theme="blue"] {
+  --color-bg: #191b1d;
+  --color-surface: #26282a;
+  --color-text: #e9ebec;
+  --color-accent: #56a3ef;
+  --color-accent-2: #86b8eb;
+
+  --color-neutral-50: #f9fbfc;
+  --color-neutral-100: #f3f7f9;
+  --color-neutral-200: #e4eaee;
+  --color-neutral-300: #d0d8dd;
+  --color-neutral-400: #b4bdc3;
+  --color-neutral-500: #989fa4;
+  --color-neutral-600: #7c8083;
+  --color-neutral-700: #5f6264;
+  --color-neutral-800: #444647;
+  --color-neutral-850: #2c2d2e;
+  --color-neutral-900: #26282a;
+  --color-neutral-950: #191b1d;
+
+  --color-sky-50: #f7fbff;
+  --color-sky-100: #f1f7ff;
+  --color-sky-200: #ddedfe;
+  --color-sky-300: #beddfd;
+  --color-sky-400: #8fc5fc;
+  --color-sky-500: #5ba9f5;
+  --color-sky-600: #4b89c6;
+  --color-sky-700: #45698e;
+  --color-sky-800: #314b65;
+  --color-sky-850: #2a3f55;
+  --color-sky-900: #233140;
+  --color-sky-950: #1d2833;
+
+  --color-violet-300: #beddfd;
+  --color-violet-400: #a6cdf6;
+  --color-violet-500: #86b8eb;
+  --color-violet-600: #689acc;
+  --color-violet-900: #28313a;
+}
+
+html[data-theme="green"] {
+  --color-bg: #1b1d1a;
+  --color-surface: #292b28;
+  --color-text: #e9ede8;
+  --color-accent: #64c37c;
+  --color-accent-2: #84d295;
+
+  --color-neutral-50: #fafbf9;
+  --color-neutral-100: #f4f8f3;
+  --color-neutral-200: #e7ece5;
+  --color-neutral-300: #d4dcd1;
+  --color-neutral-400: #bac2b7;
+  --color-neutral-500: #9fa69d;
+  --color-neutral-600: #828680;
+  --color-neutral-700: #646763;
+  --color-neutral-800: #474947;
+  --color-neutral-850: #2f302e;
+  --color-neutral-900: #292b28;
+  --color-neutral-950: #1b1d1a;
+
+  --color-sky-50: #f6fdf7;
+  --color-sky-100: #effcf1;
+  --color-sky-200: #d8f7dd;
+  --color-sky-300: #b3f0bf;
+  --color-sky-400: #71e58f;
+  --color-sky-500: #5fc97b;
+  --color-sky-600: #63a070;
+  --color-sky-700: #55785c;
+  --color-sky-800: #3d5641;
+  --color-sky-850: #344938;
+  --color-sky-900: #2a382d;
+  --color-sky-950: #232d25;
+
+  --color-violet-300: #b3f0bf;
+  --color-violet-400: #a5e1b1;
+  --color-violet-500: #84d295;
+  --color-violet-600: #7db087;
+  --color-violet-900: #2e3730;
+}
+
+html[data-theme="red"] {
+  --color-bg: #1e1819;
+  --color-surface: #2b2526;
+  --color-text: #ece9ea;
+  --color-accent: #e76d67;
+  --color-accent-2: #e6968f;
+
+  --color-neutral-50: #fcfafa;
+  --color-neutral-100: #f9f4f5;
+  --color-neutral-200: #eee6e7;
+  --color-neutral-300: #ddd2d3;
+  --color-neutral-400: #c2b6b7;
+  --color-neutral-500: #a49798;
+  --color-neutral-600: #847a7b;
+  --color-neutral-700: #645e5e;
+  --color-neutral-800: #474343;
+  --color-neutral-850: #2e2c2c;
+  --color-neutral-900: #2b2526;
+  --color-neutral-950: #1e1819;
+
+  --color-sky-50: #fff9f8;
+  --color-sky-100: #fff3f2;
+  --color-sky-200: #fee2df;
+  --color-sky-300: #fdc8c2;
+  --color-sky-400: #fc9e96;
+  --color-sky-500: #ed736c;
+  --color-sky-600: #c55953;
+  --color-sky-700: #8d4c48;
+  --color-sky-800: #653633;
+  --color-sky-850: #552e2b;
+  --color-sky-900: #3f2523;
+  --color-sky-950: #321f1d;
+
+  --color-violet-300: #fdc8c2;
+  --color-violet-400: #f1b4ae;
+  --color-violet-500: #e6968f;
+  --color-violet-600: #c8756e;
+  --color-violet-900: #3a2927;
+}
+
+html[data-theme="orange"] {
+  --color-bg: #201d1b;
+  --color-surface: #2e2b29;
+  --color-text: #eeecec;
+  --color-accent: #eda15b;
+  --color-accent-2: #ecb98d;
+
+  --color-neutral-50: #fcfbfa;
+  --color-neutral-100: #faf6f4;
+  --color-neutral-200: #f0eae7;
+  --color-neutral-300: #e1d9d5;
+  --color-neutral-400: #cac0bc;
+  --color-neutral-500: #b0a6a1;
+  --color-neutral-600: #8d8784;
+  --color-neutral-700: #6c6866;
+  --color-neutral-800: #4d4a49;
+  --color-neutral-850: #323130;
+  --color-neutral-900: #2e2b29;
+  --color-neutral-950: #201d1b;
+
+  --color-sky-50: #fffbf7;
+  --color-sky-100: #fff7f1;
+  --color-sky-200: #feecdd;
+  --color-sky-300: #fedbbd;
+  --color-sky-400: #fdc08b;
+  --color-sky-500: #f1a55f;
+  --color-sky-600: #bf8b5c;
+  --color-sky-700: #8d6d52;
+  --color-sky-800: #654e3a;
+  --color-sky-850: #554232;
+  --color-sky-900: #41352a;
+  --color-sky-950: #352b23;
+
+  --color-violet-300: #fedbbd;
+  --color-violet-400: #f4cdab;
+  --color-violet-500: #ecb98d;
+  --color-violet-600: #cd9f78;
+  --color-violet-900: #3e362f;
+}
+
+html[data-theme="yellow"] {
+  --color-bg: #23211f;
+  --color-surface: #32312e;
+  --color-text: #f1f0ee;
+  --color-accent: #edd962;
+  --color-accent-2: #f2e284;
+
+  --color-neutral-50: #fdfcf9;
+  --color-neutral-100: #fbf8f3;
+  --color-neutral-200: #f3efe6;
+  --color-neutral-300: #e6e1d6;
+  --color-neutral-400: #d3cdc1;
+  --color-neutral-500: #bcb8b0;
+  --color-neutral-600: #999792;
+  --color-neutral-700: #767471;
+  --color-neutral-800: #545351;
+  --color-neutral-850: #383736;
+  --color-neutral-900: #32312e;
+  --color-neutral-950: #23211f;
+
+  --color-sky-50: #fffef5;
+  --color-sky-100: #fffced;
+  --color-sky-200: #fef8d4;
+  --color-sky-300: #fef2ab;
+  --color-sky-400: #fee75f;
+  --color-sky-500: #f1db56;
+  --color-sky-600: #c4b76c;
+  --color-sky-700: #958d62;
+  --color-sky-800: #6b6647;
+  --color-sky-850: #5b573d;
+  --color-sky-900: #474534;
+  --color-sky-950: #3a382b;
+
+  --color-violet-300: #fef2ab;
+  --color-violet-400: #f7eba4;
+  --color-violet-500: #f2e284;
+  --color-violet-600: #d7cd8e;
+  --color-violet-900: #46453a;
+}
+
+html[data-theme="black"] {
+  --color-bg: #191919;
+  --color-surface: #262626;
+  --color-text: #e9e9e9;
+  --color-accent: #d1d1d1;
+  --color-accent-2: #b7b7b7;
+
+  --color-neutral-50: #fafafa;
+  --color-neutral-100: #f5f5f5;
+  --color-neutral-200: #e8e8e8;
+  --color-neutral-300: #d4d4d4;
+  --color-neutral-400: #b7b7b7;
+  --color-neutral-500: #989898;
+  --color-neutral-600: #7a7a7a;
+  --color-neutral-700: #5e5e5e;
+  --color-neutral-800: #424242;
+  --color-neutral-850: #2b2b2b;
+  --color-neutral-900: #262626;
+  --color-neutral-950: #191919;
+
+  --color-sky-50: #fafafa;
+  --color-sky-100: #f5f5f5;
+  --color-sky-200: #e8e8e8;
+  --color-sky-300: #d4d4d4;
+  --color-sky-400: #b7b7b7;
+  --color-sky-500: #989898;
+  --color-sky-600: #7a7a7a;
+  --color-sky-700: #5d5d5d;
+  --color-sky-800: #424242;
+  --color-sky-850: #383838;
+  --color-sky-900: #2b2b2b;
+  --color-sky-950: #232323;
+
+  --color-violet-300: #d4d4d4;
+  --color-violet-400: #c1c1c1;
+  --color-violet-500: #a9a9a9;
+  --color-violet-600: #8a8a8a;
+  --color-violet-900: #2b2b2b;
+}
+
 body {
   background: var(--color-bg);
   color: var(--color-text);

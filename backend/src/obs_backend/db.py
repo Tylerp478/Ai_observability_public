@@ -607,6 +607,16 @@ CREATE TABLE IF NOT EXISTS allowed_emails (
 
 CREATE INDEX IF NOT EXISTS allowed_emails_invite_idx
     ON allowed_emails(invite_hash) WHERE invite_hash IS NOT NULL;
+
+-- Which accent this person sees. On `users` rather than `allowed_emails`
+-- because it belongs to the person, not to their authorization: revoking
+-- someone and letting them back in should not silently restyle their app, and
+-- a pending invite has nobody to have a preference yet.
+--
+-- No CHECK constraint on the value. The list of themes is a UI fact that will
+-- gain entries, and a constraint here would mean a schema migration to add a
+-- colour; the API validates against the one list that already has to exist.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS theme TEXT NOT NULL DEFAULT 'purple';
 """
 
 

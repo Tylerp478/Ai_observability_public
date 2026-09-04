@@ -6,6 +6,7 @@ import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { PROJECT_PARAM, currentProjectId, setCurrentProjectId } from "@/lib/project";
+import { ThemePicker } from "@/components/theme-picker";
 
 /**
  * Auth gate plus chrome for signed-in pages.
@@ -136,6 +137,8 @@ export function Shell({ children }: { children: React.ReactNode }) {
           >
             {initials}
           </span>
+
+          <ThemePicker current={data?.theme ?? "purple"} />
 
           <button
             onClick={async () => {

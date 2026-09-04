@@ -41,14 +41,18 @@ import { api, type Overview } from "@/lib/api";
  * them without hovering, and the same numbers are exact on the Traces page.
  */
 
-// Light → dark, matching the tier ladder. Steps taken from the app's own sky
-// ramp (300/400/500/600) rather than invented.
-const TIER_RAMP = ["#d2cefd", "#b5abfc", "#968ae0", "#796cbf"];
+// Light → dark, matching the tier ladder. Referenced as the ramp's variables,
+// not as the hex values they currently hold: these started life as literals
+// copied out of the sky ramp, which was accurate and became wrong the moment
+// the accent could change per user — the donut kept its purple while every
+// other accent on the page followed the theme. A copied colour is a colour
+// that stops agreeing with its source.
+const TIER_RAMP = ["var(--color-sky-300)", "var(--color-sky-400)", "var(--color-sky-500)", "var(--color-sky-600)"];
 
 // Anything the pricing table cannot rank — a model retired before it was
 // priced, or one newer than the table. Neutral rather than a fifth rung,
 // because it has no place in the order.
-const OFF_LADDER = "#595d6c";
+const OFF_LADDER = "var(--color-neutral-700)";
 
 // Past this many slices a donut stops being readable, so the tail folds into
 // one "Other" segment rather than growing more colours.
@@ -208,7 +212,7 @@ export function ModelMix({ data }: { data: Overview }) {
                   fill={s.color}
                   // The gap between segments is the card surface showing
                   // through, not a border drawn around each slice.
-                  stroke="#232532"
+                  stroke="var(--color-neutral-900)"
                   strokeWidth="2"
                   className="cursor-default transition-opacity"
                   opacity={hover === null || hover === i ? 1 : 0.45}
