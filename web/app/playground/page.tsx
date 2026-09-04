@@ -120,6 +120,17 @@ function Playground() {
         )}
 
         <div className="flex flex-wrap gap-2">
+          {/* Key before model, because the key decides the model list —
+              useModels filters to the selected credential's provider. Read
+              left to right, the controls now run in the order the values
+              depend on instead of against it. */}
+          <div className="flex-1">
+            <CredentialPicker
+              value={credentialId}
+              onChange={setCredentialId}
+              label="Generate with"
+            />
+          </div>
           <label className="flex-1">
             <span className="kicker mb-1 block">Model</span>
             <select
@@ -134,13 +145,6 @@ function Playground() {
               ))}
             </select>
           </label>
-          <div className="flex-1">
-            <CredentialPicker
-              value={credentialId}
-              onChange={setCredentialId}
-              label="Generate with"
-            />
-          </div>
           <label className="w-28">
             <span className="kicker mb-1 block">Max tokens</span>
             <input

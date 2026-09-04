@@ -608,17 +608,21 @@ class GeminiProvider:
 
     name = GEMINI
     label = "Google Gemini"
-    # Stable models only. `gemini-3.1-pro-preview` is the only Pro-class model
-    # in the 3.x line and is still preview, so 2.5 Pro stays as the Pro option
-    # — offering a preview id in a tool that reports spend is how you end up
-    # billing a model that changed under you, which is exactly what the xAI
-    # retirement did on 2026-05-15.
-    models = (
-        "gemini-3.7-flash",
-        "gemini-3.6-flash",
-        "gemini-3.5-flash-lite",
-        "gemini-2.5-pro",
-    )
+    # Narrowed to the one model a free-tier key is expected to serve.
+    #
+    # This is an *offer* list, not a pricing list: the Flash and Pro entries
+    # stay fully priced in the SDK's table, so spans already carrying them keep
+    # costing correctly and `provider_of_model` still claims them for the
+    # cross-vendor guard. Four Gemini ids were already priced-but-not-offered
+    # before this, so the shape is the established one rather than a new idea.
+    #
+    # Widen it again by adding ids back here — nothing else has to change.
+    #
+    # Note this cannot itself enforce a quota. Google's `models.list()` returns
+    # the same catalogue whichever tier a key is on; free tier differs by rate
+    # limit, not by availability. So this list expresses an intention about
+    # spend, and a 429 from Google remains the thing that actually says no.
+    models = ("gemini-3.5-flash-lite",)
     key_hint = "AIza…"
 
     @staticmethod
